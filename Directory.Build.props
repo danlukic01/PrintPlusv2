@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <SystemTextJsonVersion>5.0.2</SystemTextJsonVersion>
+    <MicrosoftExtensionsConfigurationVersion>5.0.0</MicrosoftExtensionsConfigurationVersion>
+  </PropertyGroup>
+  
+  <ItemGroup>
+    <PackageReference Update="System.Text.Json" Version="$(SystemTextJsonVersion)" />
+    <PackageReference Update="Microsoft.Extensions.Configuration" Version="$(MicrosoftExtensionsConfigurationVersion)" />
+    <PackageReference Update="Microsoft.Extensions.Configuration.Abstractions" Version="$(MicrosoftExtensionsConfigurationVersion)" />
+    <PackageReference Update="Microsoft.Extensions.Configuration.FileExtensions" Version="$(MicrosoftExtensionsConfigurationVersion)" />
+    <PackageReference Update="Microsoft.Extensions.Configuration.Json" Version="$(MicrosoftExtensionsConfigurationVersion)" />
+  </ItemGroup>
+</Project>
