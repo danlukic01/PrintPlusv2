@@ -24,6 +24,5 @@ SAP native libraries are required at runtime and are included in the repository.
   from SharePoint. Files with identical names no longer overwrite each other.
 - A numeric counter is appended before the file extension to keep each
   downloaded path distinct.
-- Repeated requests for the same SharePoint link now return the already
-  downloaded file instead of creating duplicate copies.
+
 - Additional inline comments explain this behaviour in `SharePointService.cs`.
