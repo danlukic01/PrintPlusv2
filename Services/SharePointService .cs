@@ -28,6 +28,9 @@ namespace PrintPlusService.Services
         private IConfidentialClientApplication _app;
         private readonly IConfigurationService _configService;
         private readonly ILogger<SharePointService> _logger;
+        // Counter used to generate unique file names when downloading
+        // attachments from SharePoint.  This prevents multiple documents with
+        // the same original name from overwriting each other.
         private static int fileUniq = 1; // Ensuring a unique filename for each download
                                          // private static readonly SemaphoreSlim _downloadLock = new SemaphoreSlim(1, 1);
 
@@ -102,9 +105,27 @@ namespace PrintPlusService.Services
         /// <exception cref="Exception">Thrown if the download process fails or the file cannot be retrieved.</exception>
         public async Task<string> DownloadFileFromShareLinkAsync(string shareLink, string destinationPath)
         {
+            // Normalise URL for consistent caching
+            shareLink = CleanURL(shareLink);
+
+            var cacheKey = $"{shareLink}|{destinationPath}";
+            var downloadTask = _downloadedFileCache.GetOrAdd(cacheKey, _ => DownloadFileFromShareLinkInternalAsync(shareLink, destinationPath));
+
             try
             {
-                shareLink = CleanURL(shareLink);
+                return await downloadTask;
+            }
+            catch
+            {
+                _downloadedFileCache.TryRemove(cacheKey, out _);
+                throw;
+            }
+        }
+
+        private async Task<string> DownloadFileFromShareLinkInternalAsync(string shareLink, string destinationPath)
+        {
+            try
+            {
                 _logger.LogInformation($"Attempting direct download using link: {shareLink}");
 
                 if (!shareLink.Contains("sharepoint.com"))
@@ -119,6 +140,8 @@ namespace PrintPlusService.Services
                     if (directResponse.IsSuccessStatusCode)
                     {
                         var fileName = SanitiseFileName(Path.GetFileName(shareLink));
+                        // Ensure files with identical names do not overwrite each other
+                        fileName = GenerateUniqueFilename(fileName, ref fileUniq);
                         var finalPath = Path.Combine(destinationPath, fileName);
 
                         await using var fs = new FileStream(finalPath, FileMode.Create, FileAccess.Write);
@@ -145,6 +168,8 @@ namespace PrintPlusService.Services
 
                 var ext = Path.GetExtension(originalFileName);
                 var fileNameGraph = SanitiseFileName(Path.GetFileNameWithoutExtension(originalFileName)) + ext;
+                // Prevent name clashes when multiple attachments share the same name
+                fileNameGraph = GenerateUniqueFilename(fileNameGraph, ref fileUniq);
                 var finalGraphPath = Path.Combine(destinationPath, fileNameGraph);
 
                 var encodedUrl = EncodeUrlForGraphAPI(shareLink);
@@ -591,7 +616,11 @@ namespace PrintPlusService.Services
             string uniqueFilename;
             lock (this) // Use 'this' to ensure it's an instance lock
             {
-                uniqueFilename = baseFilename;
+                // Append an incrementing number before the extension so each
+                // downloaded file path remains distinct.
+                string name = Path.GetFileNameWithoutExtension(baseFilename);
+                string ext = Path.GetExtension(baseFilename);
+                uniqueFilename = $"{name}_{fileUniq}{ext}";
                 fileUniq++;
             }
             return SanitiseFileName(uniqueFilename);
