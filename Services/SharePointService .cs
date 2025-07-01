@@ -9,6 +9,8 @@ using Microsoft.Identity.Client;
 using Newtonsoft.Json.Linq;
 using System.Linq;
 using System.Security.Policy;
+using System.Threading;
+using System.Collections.Concurrent;
 
 namespace PrintPlusService.Services
 {
@@ -27,6 +29,9 @@ namespace PrintPlusService.Services
         private readonly IConfigurationService _configService;
         private readonly ILogger<SharePointService> _logger;
         private static int fileUniq = 1; // Ensuring a unique filename for each download
+                                         // private static readonly SemaphoreSlim _downloadLock = new SemaphoreSlim(1, 1);
+
+        private static readonly ConcurrentDictionary<string, Task<string>> _downloadedFileCache = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// Initialises a new instance of the <see cref="SharePointService"/> class.
@@ -95,110 +100,106 @@ namespace PrintPlusService.Services
         /// <param name="destinationPath">The directory path where the downloaded file will be saved.</param>
         /// <returns>The full path to the downloaded file.</returns>
         /// <exception cref="Exception">Thrown if the download process fails or the file cannot be retrieved.</exception>
-
         public async Task<string> DownloadFileFromShareLinkAsync(string shareLink, string destinationPath)
         {
             try
             {
-                // Clean the share link using the existing CleanURL method
                 shareLink = CleanURL(shareLink);
-
-                // Parse the URI instead of using Uri.IsWellFormedUriString
-                Uri uriResult;
-                if (!Uri.TryCreate(shareLink, UriKind.Absolute, out uriResult))
-                {
-                    _logger.LogWarning($"The share link '{shareLink}' is not a valid absolute URI, but attempting to proceed.");
-                }
-
                 _logger.LogInformation($"Attempting direct download using link: {shareLink}");
 
-                // Skip Graph API if it's not a SharePoint link
                 if (!shareLink.Contains("sharepoint.com"))
                 {
-                    // Mimic browser headers for direct download
                     var requestMessage = new HttpRequestMessage(HttpMethod.Get, shareLink);
-                    requestMessage.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36");
-                    requestMessage.Headers.Add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8");
-                    requestMessage.Headers.Add("Accept-Language", "en-US,en;q=0.5");
+                    requestMessage.Headers.Add("User-Agent", "Mozilla/5.0");
+                    requestMessage.Headers.Add("Accept", "*/*");
                     requestMessage.Headers.Add("Referer", "https://www.google.com/");
                     requestMessage.Headers.Add("Connection", "keep-alive");
 
                     var directResponse = await _httpClient.SendAsync(requestMessage);
                     if (directResponse.IsSuccessStatusCode)
                     {
-                        // Use your existing method to sanitize the file name
-                        string fileName = SanitiseFileName(Path.GetFileName(shareLink));
-                        string finalDestinationPath = Path.Combine(destinationPath, fileName);
+                        var fileName = SanitiseFileName(Path.GetFileName(shareLink));
+                        var finalPath = Path.Combine(destinationPath, fileName);
 
-                        await using (var fs = new FileStream(finalDestinationPath, FileMode.Create, FileAccess.Write))
-                        {
-                            await directResponse.Content.CopyToAsync(fs);
-                        }
-                        _logger.LogInformation($"Successfully downloaded file directly to: {finalDestinationPath}");
-                        return finalDestinationPath;
+                        await using var fs = new FileStream(finalPath, FileMode.Create, FileAccess.Write);
+                        await directResponse.Content.CopyToAsync(fs);
+                        _logger.LogInformation($"Successfully downloaded file directly to: {finalPath}");
+                        return finalPath;
                     }
                     else
                     {
-                        _logger.LogWarning($"Direct download failed with status: {directResponse.StatusCode}, skipping Graph API.");
                         throw new Exception($"Direct download failed: {directResponse.StatusCode}");
                     }
                 }
 
-                // Fallback to Graph API (if it's a SharePoint link)
-                _logger.LogInformation($"Attempting to acquire token for SharePoint download using link: {shareLink}");
                 var scopes = new[] { $"{await _configService.GetSettingAsync("AzureAd", "ApiUrl")}.default" };
                 var authResult = await AcquireTokenAsync(_app, scopes);
+
                 _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", authResult.AccessToken);
                 _httpClient.DefaultRequestHeaders.Accept.Clear();
                 _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-                _logger.LogInformation("Acquired token successfully");
-
-                // Retrieve the file name from the share link using the Graph API
-                string originalFileName = await GetFileNameFromShareLinkAsync(shareLink, authResult.AccessToken);
+                var originalFileName = await GetFileNameFromLinkAsync(shareLink, authResult.AccessToken);
                 if (string.IsNullOrEmpty(originalFileName))
-                {
                     throw new Exception("Unable to retrieve the file name from the share link.");
-                }
 
-                // Generate a unique and sanitised filename with the correct extension
-                string originalFileExtension = Path.GetExtension(originalFileName);
-                string fileNameGraph = SanitiseFileName(Path.GetFileNameWithoutExtension(originalFileName)) + originalFileExtension;
-                string finalDestinationPathGraph = Path.Combine(destinationPath, fileNameGraph);
+                var ext = Path.GetExtension(originalFileName);
+                var fileNameGraph = SanitiseFileName(Path.GetFileNameWithoutExtension(originalFileName)) + ext;
+                var finalGraphPath = Path.Combine(destinationPath, fileNameGraph);
 
-                // Encode the share link for the Graph API
-                var base64Value = Convert.ToBase64String(Encoding.UTF8.GetBytes(shareLink));
-                var encodedUrl = $"u!{base64Value.TrimEnd('=').Replace('/', '_').Replace('+', '-')}";
-
-                _logger.LogInformation($"Encoded share link for Graph API: {encodedUrl}");
-
-                // Get download URL using the encoded URL
+                var encodedUrl = EncodeUrlForGraphAPI(shareLink);
                 var graphApiUrl = $"{await _configService.GetSettingAsync("AzureAd", "ApiUrl")}/v1.0/shares/{encodedUrl}/driveItem";
                 _logger.LogInformation($"Calling Graph API URL: {graphApiUrl}");
 
-                string downloadUrl = await GetDownloadUrlAsync(graphApiUrl, authResult.AccessToken);
+                var downloadUrl = await GetDownloadUrlAsync(graphApiUrl, authResult.AccessToken);
                 if (downloadUrl == null)
-                {
                     throw new Exception("Unable to retrieve download URL.");
+
+                if (File.Exists(finalGraphPath))
+                {
+                    try
+                    {
+                        var fileInfo = new FileInfo(finalGraphPath);
+
+                        if (fileInfo.IsReadOnly)
+                        {
+                            fileInfo.IsReadOnly = false;
+                        }
+
+                        File.Delete(finalGraphPath);
+                    }
+                    catch (UnauthorizedAccessException ex)
+                    {
+                        _logger.LogError(ex, "Access denied while trying to delete file: {FilePath}", finalGraphPath);
+                        throw;
+                    }
+                    catch (IOException ioEx)
+                    {
+                        _logger.LogWarning(ioEx, "IO error on first delete attempt for: {FilePath}. Retrying...", finalGraphPath);
+                        await Task.Delay(200);
+
+                        try
+                        {
+                            File.Delete(finalGraphPath);
+                        }
+                        catch (Exception retryEx)
+                        {
+                            _logger.LogError(retryEx, "Second delete attempt failed for: {FilePath}", finalGraphPath);
+                            throw;
+                        }
+                    }
                 }
 
-                // Download the file from the Graph API
-                await DownloadFileFromUrlAsync(downloadUrl, finalDestinationPathGraph);
-                _logger.LogInformation($"Successfully downloaded file to: {finalDestinationPathGraph}");
-                return finalDestinationPathGraph;
-            }
-            catch (HttpRequestException ex)
-            {
-                _logger.LogError(ex, $"HTTP request error downloading file from {shareLink}: {ex.Message}");
-                throw new Exception($"Error downloading file from {shareLink}: {ex.Message}", ex);
+                await DownloadFileFromUrlAsync(downloadUrl, finalGraphPath);
+                _logger.LogInformation($"Successfully downloaded file to: {finalGraphPath}");
+                return finalGraphPath;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"General error downloading file from {shareLink}");
+                _logger.LogError(ex, $"Error downloading file from {shareLink}");
                 throw new Exception($"Error downloading file from {shareLink}", ex);
             }
         }
-
 
         /// <summary>
         /// Backward-compatible wrapper for the DownloadFileFromShareLinkAsync method.
@@ -221,32 +222,32 @@ namespace PrintPlusService.Services
         /// <param name="accessToken">The access token for authenticating with the Graph API.</param>
         /// <returns>The file name extracted from the share link metadata.</returns>
         /// <exception cref="Exception">Thrown if the file name cannot be retrieved or the API call fails.</exception>
-
         private async Task<string> GetFileNameFromShareLinkAsync(string shareLink, string accessToken)
         {
             try
             {
-                // Encode the share link for use with the Graph API
-                var base64Value = Convert.ToBase64String(Encoding.UTF8.GetBytes(shareLink));
-                var encodedUrl = $"u!{base64Value.TrimEnd('=').Replace('/', '_').Replace('+', '-')}";
+                // Strip query parameters to get the clean base URL
+                var uri = new Uri(shareLink);
+                var cleanLink = uri.GetLeftPart(UriPartial.Path);
 
-                // Form the API URL to get the drive item metadata
-                var graphApiUrl = $"{await _configService.GetSettingAsync("AzureAd", "ApiUrl")}/v1.0/shares/{encodedUrl}/driveItem";
+                // Use helper to encode the URL for Graph API
+                var encodedUrl = EncodeUrlForGraphAPI(cleanLink);
 
-                // Set up the HttpClient with authorization header
-                _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-                _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                var graphApiBaseUrl = await _configService.GetSettingAsync("AzureAd", "ApiUrl");
+                var graphApiUrl = $"{graphApiBaseUrl}/v1.0/shares/{encodedUrl}/driveItem";
 
-                // Make the API call to get the file metadata
-                var response = await _httpClient.GetAsync(graphApiUrl);
+                // Create request with appropriate headers
+                using var request = new HttpRequestMessage(HttpMethod.Get, graphApiUrl);
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+                var response = await _httpClient.SendAsync(request);
                 response.EnsureSuccessStatusCode();
 
                 var responseBody = await response.Content.ReadAsStringAsync();
                 dynamic metadata = JObject.Parse(responseBody);
 
-                // Extract and return the file name from the metadata
-                string fileName = metadata.name;
-                return fileName;
+                return metadata.name;
             }
             catch (HttpRequestException ex)
             {
@@ -257,6 +258,102 @@ namespace PrintPlusService.Services
             {
                 _logger.LogError(ex, $"General error retrieving file name from {shareLink}");
                 throw new Exception($"Error retrieving file name from {shareLink}", ex);
+            }
+        }
+
+        public async Task<string> GetFileNameFromPathLinkAsync(string shareLink, string accessToken)
+        {
+            try
+            {
+
+                shareLink = CleanURL(shareLink);
+
+                var uri = new Uri(shareLink);
+                var host = uri.Host; // e.g., gm3global.sharepoint.com
+
+                // Extract site and relative path dynamically
+                string[] segments = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+                // Find the index of "sites" and get site name
+                int siteIndex = Array.IndexOf(segments, "sites");
+                if (siteIndex == -1 || siteIndex + 1 >= segments.Length)
+                    throw new Exception("Invalid SharePoint URL format: site name not found.");
+
+                string siteName = segments[siteIndex + 1];
+                string relativeFilePath = string.Join('/', segments.Skip(siteIndex + 2));
+
+                // Get the site ID dynamically
+                var siteApiUrl = $"https://graph.microsoft.com/v1.0/sites/{host}:/sites/{siteName}";
+                var siteRequest = new HttpRequestMessage(HttpMethod.Get, siteApiUrl);
+                siteRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+                var siteResponse = await _httpClient.SendAsync(siteRequest);
+                siteResponse.EnsureSuccessStatusCode();
+                var siteContent = await siteResponse.Content.ReadAsStringAsync();
+                dynamic siteMetadata = JObject.Parse(siteContent);
+                string siteId = siteMetadata.id;
+
+                // Get all document libraries (drives) in the site
+                var drivesApiUrl = $"https://graph.microsoft.com/v1.0/sites/{siteId}/drives";
+                var drivesRequest = new HttpRequestMessage(HttpMethod.Get, drivesApiUrl);
+                drivesRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+                var drivesResponse = await _httpClient.SendAsync(drivesRequest);
+                drivesResponse.EnsureSuccessStatusCode();
+                var drivesContent = await drivesResponse.Content.ReadAsStringAsync();
+                dynamic drivesData = JObject.Parse(drivesContent);
+
+                // Find the first drive that matches the path prefix
+                string driveId = null;
+                foreach (var drive in drivesData.value)
+                {
+                    string driveName = drive.name;
+                    if (relativeFilePath.StartsWith(driveName + "/", StringComparison.OrdinalIgnoreCase))
+                    {
+                        driveId = drive.id;
+                        relativeFilePath = relativeFilePath.Substring(driveName.Length).TrimStart('/');
+                        break;
+                    }
+                }
+
+                if (string.IsNullOrEmpty(driveId))
+                    throw new Exception($"No matching document library found for path: {relativeFilePath}");
+
+                // Now retrieve the file metadata
+                var fileApiUrl = $"https://graph.microsoft.com/v1.0/drives/{driveId}/root:/{relativeFilePath}";
+                var fileRequest = new HttpRequestMessage(HttpMethod.Get, fileApiUrl);
+                fileRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+                fileRequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+                var fileResponse = await _httpClient.SendAsync(fileRequest);
+                fileResponse.EnsureSuccessStatusCode();
+                var fileContent = await fileResponse.Content.ReadAsStringAsync();
+                dynamic fileMetadata = JObject.Parse(fileContent);
+
+                return fileMetadata.name;
+            }
+            catch (HttpRequestException ex)
+            {
+                _logger.LogError(ex, "HTTP request error while retrieving file name from {ShareLink}", shareLink);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "General error retrieving file name from {ShareLink}", shareLink);
+                throw;
+            }
+        }
+
+
+        private async Task<string> GetFileNameFromLinkAsync(string link, string accessToken)
+        {
+            if (link.Contains(":/s/") || link.Contains(":/b:/")) // It's a sharing link
+            {
+                return await GetFileNameFromShareLinkAsync(link, accessToken);
+            }
+            else
+            {
+                return await GetFileNameFromPathLinkAsync(link, accessToken); // direct path
             }
         }
 
@@ -309,30 +406,45 @@ namespace PrintPlusService.Services
                 string fileExtension = Path.GetExtension(destinationPath);
                 string validFileName = $"{cleanedFileName}{fileExtension}";
 
-                // Combine cleaned filename with the destination directory
                 string validDestinationPath = Path.Combine(Path.GetDirectoryName(destinationPath), validFileName);
 
-                // Ensure the path length is within the limit
                 if (validDestinationPath.Length > 260)
-                {
-                    throw new PathTooLongException("The destination path is too long.");
-                }
+                    return; // or log and return silently
 
                 using (HttpClient client = new HttpClient())
                 {
                     var response = await client.GetAsync(downloadUrl);
                     response.EnsureSuccessStatusCode();
                     byte[] fileBytes = await response.Content.ReadAsByteArrayAsync();
-                    await File.WriteAllBytesAsync(validDestinationPath, fileBytes);
+
+                    try
+                    {
+                        await File.WriteAllBytesAsync(validDestinationPath, fileBytes);
+                    }
+                    catch (IOException ioEx)
+                    {
+                        // File is likely locked — skip and continue
+                        return;
+                    }
                 }
-                //_logger.LogInformation($"Successfully downloaded file to {validDestinationPath}");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Error downloading file from {downloadUrl}");
-                throw;
+               // _logger?.LogWarning(ex, "Failed to download file: {Url}", downloadUrl);
+                return;
             }
         }
+
+        private static bool IsFileLocked(IOException ex)
+        {
+            // Windows error code for "The process cannot access the file because it is being used by another process."
+            const int ERROR_SHARING_VIOLATION = 0x20;
+            const int ERROR_LOCK_VIOLATION = 0x21;
+
+            int hresult = ex.HResult & 0xFFFF; // Get the low 16 bits of the HResult
+            return hresult == ERROR_SHARING_VIOLATION || hresult == ERROR_LOCK_VIOLATION;
+        }
+
 
         /// <summary>
         /// Cleans a file name by replacing invalid characters with underscores and truncating
@@ -367,9 +479,9 @@ namespace PrintPlusService.Services
         {
             try
             {
-                _logger.LogInformation("Acquiring token...");
+               // _logger.LogInformation("Acquiring token...");
                 var result = await app.AcquireTokenForClient(scopes).ExecuteAsync();
-                _logger.LogInformation("Token acquired successfully.");
+              //  _logger.LogInformation("Token acquired successfully.");
                 return result;
             }
             catch (MsalServiceException ex)
@@ -412,23 +524,18 @@ namespace PrintPlusService.Services
         /// </summary>
         /// <param name="input">The original URL.</param>
         /// <returns>The cleaned URL.</returns>
-
-        private static string CleanURL(string url)
+        public static string CleanURL(string url)
         {
-            //// Remove CDATA tags
-            //input = input.Replace("<![CDATA[", "").Replace("]]>", "");
+            if (string.IsNullOrWhiteSpace(url)) return url;
 
-            //// Replace encoded spaces with actual spaces
-            //input = input.Replace("%20", " ");
-
-            //// Trim any leading or trailing whitespaces that might cause issues
-            //input = input.Trim();
-
-            //return url;
-
-            return url.Replace("<![CDATA[", "").Replace("]]>", "").Replace("%20", " ").Replace("%23", "#");
-
+            return Uri.UnescapeDataString(
+                url.Replace("<![CDATA[", "")
+                   .Replace("]]>", "")
+                   .Replace('\\', '/') // <-- critical!
+                   .Trim()
+            );
         }
+
 
         /// <summary>
         /// Encodes a URL for use with the Microsoft Graph API by converting it to a Base64-encoded format and replacing reserved characters.
@@ -436,10 +543,15 @@ namespace PrintPlusService.Services
         /// <param name="url">The original URL to encode.</param>
         /// <returns>The encoded URL in a format compatible with the Graph API.</returns>
 
-        private static string EncodeUrlForGraphAPI(string url)
+        public static string EncodeUrlForGraphAPI(string url)
         {
-            var base64Value = Convert.ToBase64String(Encoding.UTF8.GetBytes(url));
-            return $"u!{base64Value.TrimEnd('=').Replace('/', '_').Replace('+', '-')}";
+            var bytes = Encoding.UTF8.GetBytes(url);
+            var base64 = Convert.ToBase64String(bytes)
+                .TrimEnd('=')
+                .Replace('+', '-')
+                .Replace('/', '_');
+
+            return $"u!{base64}";
         }
 
         /// <summary>

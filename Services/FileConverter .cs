@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing; // Reference to System.Drawing
 using System.IO;
@@ -22,6 +23,8 @@ namespace PrintPlusService.Services
     {
         private readonly string _libreOfficePath = @"C:\Program Files\LibreOffice\program\soffice.exe";
         private readonly ILogger<FileConverter> _logger;
+        // Number of concurrent conversions 
+        private static readonly SemaphoreSlim _libreOfficeSemaphore = new(1, 4);
 
         /// <summary>
         /// Initialises a new instance of the FileConverter class.
@@ -59,16 +62,34 @@ namespace PrintPlusService.Services
             return filePath;
         }
 
+        public async Task ConvertFilesInParallelAsync(List<string> filePaths, string cachePath)
+        {
+            var tasks = filePaths.Select(async filePath =>
+            {
+                try
+                {
+                    string result = await ConvertUsingLibreOfficeAsync(filePath, cachePath);
+
+                    _logger.LogInformation($"File converted successfully: {filePath} -> {result}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"Failed to convert: {filePath}");
+                }
+            });
+
+            await Task.WhenAll(tasks);
+        }
+
         /// <summary>
         /// Converts a file using LibreOffice to PDF format.
         /// </summary>
         /// <param name="filePath">The path to the file to be converted.</param>
         /// <returns>The path to the converted PDF file.</returns>
-        private static readonly SemaphoreSlim _libreOfficeSemaphore = new(1, 1);
 
         private async Task<string> ConvertUsingLibreOfficeAsync(string filePath, string cachePath)
         {
-            _logger.LogInformation($"Converting file using LibreOffice: {filePath}");
+            var totalStopwatch = Stopwatch.StartNew();
 
             if (!File.Exists(filePath))
             {
@@ -85,7 +106,7 @@ namespace PrintPlusService.Services
             {
                 _logger.LogInformation($"Detected CSV file. Converting to XLS first: {filePath}");
 
-                var csvToXlsArgs = $"--headless --convert-to xls:\"MS Excel 97\":44,34,76,1 \"{filePath}\" --outdir \"{cachePath}\"";
+                var csvToXlsArgs = $"--headless --invisible --nologo --convert-to xls:\"MS Excel 97\":44,34,76,1 \"{filePath}\" --outdir \"{cachePath}\"";
                 var csvToXlsProcess = new ProcessStartInfo
                 {
                     FileName = _libreOfficePath,
@@ -97,6 +118,8 @@ namespace PrintPlusService.Services
                 };
 
                 await _libreOfficeSemaphore.WaitAsync();
+                var csvConversionStopwatch = Stopwatch.StartNew();
+
                 try
                 {
                     using (var process = Process.Start(csvToXlsProcess))
@@ -129,13 +152,16 @@ namespace PrintPlusService.Services
                 finally
                 {
                     _libreOfficeSemaphore.Release();
+                    csvConversionStopwatch.Stop();
+                    _logger.LogInformation(
+                    $"CSV to XLS conversion time for '{Path.GetFileName(intermediatePath)}': {csvConversionStopwatch.Elapsed:mm\\:ss} (mm:ss)");
                 }
             }
 
             // Now convert to PDF
             string outputFileName = Path.GetFileNameWithoutExtension(targetInputFile) + ".pdf";
             string expectedOutputPath = Path.Combine(cachePath, outputFileName);
-            var pdfArgs = $"--headless --convert-to pdf \"{targetInputFile}\" --outdir \"{cachePath}\"";
+            var pdfArgs = $"--headless --invisible --nologo --convert-to pdf \"{targetInputFile}\" --outdir \"{cachePath}\"";
 
             var startInfo = new ProcessStartInfo
             {
@@ -148,6 +174,8 @@ namespace PrintPlusService.Services
             };
 
             await _libreOfficeSemaphore.WaitAsync();
+            var pdfConversionStopwatch = Stopwatch.StartNew();
+
             try
             {
                 using (var process = Process.Start(startInfo))
@@ -172,7 +200,6 @@ namespace PrintPlusService.Services
                     throw new FileNotFoundException($"Converted PDF not found: {expectedOutputPath}");
                 }
 
-                _logger.LogInformation($"Successfully converted file to PDF: {expectedOutputPath}");
                 return expectedOutputPath;
             }
             catch (Exception ex)
@@ -182,9 +209,13 @@ namespace PrintPlusService.Services
             }
             finally
             {
+                pdfConversionStopwatch.Stop();
+                //totalStopwatch.Stop();
                 _libreOfficeSemaphore.Release();
 
-                // Clean up intermediate .xls
+                _logger.LogInformation(
+                    $"PDF conversion time for '{Path.GetFileName(expectedOutputPath)}': {pdfConversionStopwatch.Elapsed:mm\\:ss} (mm:ss)");
+
                 if (intermediatePath != null && File.Exists(intermediatePath))
                 {
                     try
@@ -198,137 +229,6 @@ namespace PrintPlusService.Services
                 }
             }
         }
-
-
-        //private async Task<string> ConvertUsingLibreOfficeAsync(string filePath, string cachePath)
-        //{
-        //    _logger.LogInformation($"Converting file using LibreOffice: {filePath}");
-
-        //    if (!File.Exists(filePath))
-        //    {
-        //        var errorMessage = $"File does not exist: {filePath}";
-        //        _logger.LogError(errorMessage);
-        //        throw new FileNotFoundException(errorMessage);
-        //    }
-
-        //    string intermediatePath = null;
-        //    string targetInputFile = filePath;
-
-        //    // Handle CSV conversion to XLS first
-        //    if (Path.GetExtension(filePath).Equals(".csv", StringComparison.OrdinalIgnoreCase))
-        //    {
-        //        _logger.LogInformation($"Detected CSV file. Converting to XLS first: {filePath}");
-
-        //        var csvToXlsArgs = $"--headless --convert-to xls:\"MS Excel 97\":44,34,76,1 \"{filePath}\" --outdir \"{cachePath}\"";
-
-        //        var csvToXlsProcess = new ProcessStartInfo
-        //        {
-        //            FileName = _libreOfficePath,
-        //            Arguments = csvToXlsArgs,
-        //            RedirectStandardOutput = true,
-        //            RedirectStandardError = true,
-        //            UseShellExecute = false,
-        //            CreateNoWindow = true
-        //        };
-
-        //        lock (_libreOfficeLock)
-        //        {
-        //            using (var process = Process.Start(csvToXlsProcess))
-        //            {
-        //                if (!process.WaitForExit(30000))
-        //                {
-        //                    process.Kill();
-        //                    throw new TimeoutException($"LibreOffice CSV to XLS conversion timed out: {filePath}");
-        //                }
-
-        //                string stdOut = process.StandardOutput.ReadToEnd();
-        //                string stdErr = process.StandardError.ReadToEnd();
-
-        //                if (process.ExitCode != 0)
-        //                {
-        //                    throw new Exception($"CSV to XLS conversion failed. Exit Code: {process.ExitCode}. Output: {stdOut}. Error: {stdErr}");
-        //                }
-
-        //                var xlsFileName = Path.GetFileNameWithoutExtension(filePath) + ".xls";
-        //                intermediatePath = Path.Combine(cachePath, xlsFileName);
-
-        //                if (!File.Exists(intermediatePath))
-        //                {
-        //                    throw new FileNotFoundException($"Converted XLS file not found: {intermediatePath}");
-        //                }
-
-        //                targetInputFile = intermediatePath;
-        //            }
-        //        }
-        //    }
-
-        //    // Now convert the intermediate .xls (or original non-CSV) to PDF
-        //    string outputFileName = Path.GetFileNameWithoutExtension(targetInputFile) + ".pdf";
-        //    string expectedOutputPath = Path.Combine(cachePath, outputFileName);
-
-        //    var pdfArgs = $"--headless --convert-to pdf \"{targetInputFile}\" --outdir \"{cachePath}\"";
-
-        //    var startInfo = new ProcessStartInfo
-        //    {
-        //        FileName = _libreOfficePath,
-        //        Arguments = pdfArgs,
-        //        RedirectStandardOutput = true,
-        //        RedirectStandardError = true,
-        //        UseShellExecute = false,
-        //        CreateNoWindow = true
-        //    };
-
-        //    try
-        //    {
-        //        lock (_libreOfficeLock)
-        //        {
-        //            using (var process = Process.Start(startInfo))
-        //            {
-        //                if (!process.WaitForExit(30000))
-        //                {
-        //                    process.Kill();
-        //                    throw new TimeoutException($"LibreOffice PDF conversion timed out: {targetInputFile}");
-        //                }
-
-        //                var output = process.StandardOutput.ReadToEnd();
-        //                var error = process.StandardError.ReadToEnd();
-
-        //                if (process.ExitCode != 0)
-        //                {
-        //                    throw new Exception($"LibreOffice PDF conversion failed. Exit Code: {process.ExitCode}. Output: {output}, Error: {error}");
-        //                }
-        //            }
-        //        }
-
-        //        if (!File.Exists(expectedOutputPath))
-        //        {
-        //            throw new FileNotFoundException($"Converted PDF not found: {expectedOutputPath}");
-        //        }
-
-        //        _logger.LogInformation($"Successfully converted file to PDF: {expectedOutputPath}");
-        //        return expectedOutputPath;
-        //    }
-        //    catch (Exception ex)
-        //    {
-        //        _logger.LogError(ex, $"An error occurred during LibreOffice conversion: {filePath}");
-        //        throw;
-        //    }
-        //    finally
-        //    {
-        //        // Clean up intermediate .xls file if we created one
-        //        if (intermediatePath != null && File.Exists(intermediatePath))
-        //        {
-        //            try
-        //            {
-        //                File.Delete(intermediatePath);
-        //            }
-        //            catch (Exception cleanupEx)
-        //            {
-        //                _logger.LogWarning(cleanupEx, $"Failed to delete temporary file: {intermediatePath}");
-        //            }
-        //        }
-        //    }
-        //}
 
         public async Task<bool> TryRepairPdfWithLibreOffice(string inputPath, string outputPath, string cachePath)
         {
@@ -536,7 +436,7 @@ namespace PrintPlusService.Services
 
                         // Retry mechanism for saving the document
                         const int maxRetries = 3;
-                        const int delayMilliseconds = 1000; // 1 second delay between retries
+                        const int delayMilliseconds = 500; // 1 second delay between retries
 
                         for (int attempt = 1; attempt <= maxRetries; attempt++)
                         {
@@ -637,7 +537,7 @@ namespace PrintPlusService.Services
 
                         // Retry mechanism for saving the document
                         const int maxRetries = 3;
-                        const int delayMilliseconds = 1000; // 1 second delay between retries
+                        const int delayMilliseconds = 500; // 1 second delay between retries
 
                         for (int attempt = 1; attempt <= maxRetries; attempt++)
                         {

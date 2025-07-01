@@ -1,8 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Drawing;
-using System.Drawing.Printing;
 using System.IO;
 using System.Runtime.Versioning;
 using System.Text;
@@ -12,6 +10,7 @@ using CommonInterfaces.Models;
 using CommonInterfaces;
 using Microsoft.Extensions.Logging;
 using System.Collections.Generic;
+using System.Threading.Channels;
 
 namespace PrintPlusService.Services
 {
@@ -24,6 +23,14 @@ namespace PrintPlusService.Services
         public string FilePath { get; set; }
         public string JobId { get; set; }
         public string PrintLocation { get; set; }
+        // Add these if needed for callback
+        public string WorkOrderId { get; set; }
+        public string Sequence { get; set; }
+        public string Objtyp { get; set; }
+        public int FileAcount { get; set; }
+
+        public int RetryCount { get; set; } = 0;
+
     }
 
     /// <summary>
@@ -41,8 +48,11 @@ namespace PrintPlusService.Services
         // Logger for error/info output
         private readonly ILogger<PrinterService> _logger;
 
-        // Dictionary: one print job queue per printer name
-        private readonly ConcurrentDictionary<string, BlockingCollection<PrintJob>> _printerQueues = new();
+        // Replace BlockingCollection-based queues with Channels
+        private readonly ConcurrentDictionary<string, Channel<PrintJob>> _printerChannels = new();
+
+        // Serialize print jobs per printer 
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _printerLocks = new();
 
         // Tracks all running background worker tasks (one per printer)
         private readonly List<Task> _workerTasks = new();
@@ -53,24 +63,25 @@ namespace PrintPlusService.Services
         // True if service is being shut down; prevents new jobs from being queued
         private volatile bool _isShutdownInitiated = false;
 
-        // Flag to where the file will be sent for printing L=Local N=Network printer
-        private string _printLocation = string.Empty;
+        private CancellationToken _cts;
 
-        //static PdfDocument pdfDocument;
-        //static int currentPage = 0; // Track which page is being printed
-
-        //static List<Image> pdfImages = new List<Image>();
-        //static int currentPage = 0; // Track the current page
+        private readonly PrinterStatusChecker _printerStatusChecker;
 
         /// <summary>
         /// Initialises a new instance of the <see cref="PrinterService"/> class.
         /// </summary>
         /// <param name="dataAccess">Data access interface for database operations.</param>
         /// <param name="logger">Logger for logging information and errors.</param>
-        public PrinterService(IDataAccess dataAccess, ILogger<PrinterService> logger)
+        public PrinterService(IDataAccess dataAccess, ILogger<PrinterService> logger, IStatusReporter statusReporter)
         {
             _dataAccess = dataAccess;
             _logger = logger;
+            _cts = _cts = _shutdownTokenSource.Token;
+        }
+
+        private SemaphoreSlim GetPrinterLock(string printerName)
+        {
+            return _printerLocks.GetOrAdd(printerName, _ => new SemaphoreSlim(1, 1));
         }
 
         /// <summary>
@@ -81,97 +92,41 @@ namespace PrintPlusService.Services
         /// <param name="filePath">The full path of the file to be printed.</param>
         /// <param name="jobId">The unique identifier of the print job.</param>
         /// <exception cref="Exception">Thrown if the printer or job cannot be found or an error occurs during the printing process.</exception>
-
-
-        //   public async Task PrintFileAsync(
-        //IEnumerable<string> printerNames,
-        //string filePath,
-        //string jobId)
-        //   {
-        //       var tasks = printerNames
-        //           .Select(name => PrintFileAsync(name, filePath, jobId));
-        //       await Task.WhenAll(tasks);
-        //   }
-
-        public async Task PrintFileAsync(string printerName, string filePath, string jobId, string printFlag)
+   
+        // Refactored PrintFileAsync to enqueue to per-printer channel
+        public void PrintFileAsync(string printerName, string filePath, string jobId, string printFlag, string workOrderId, string sequence, string objtyp)
         {
-            try
+            _ = Task.Run(async () =>
             {
-                // Fetch the printer settings
-
-                if (_isShutdownInitiated)
-                    throw new InvalidOperationException("PrinterService is shutting down. No new jobs can be queued.");
-
-                // Get or create queue/worker for this printer
-                var queue = _printerQueues.GetOrAdd(printerName, pn => StartPrinterWorker(pn));
-
-                queue.Add(new PrintJob
+                try
                 {
-                    PrinterName = printerName,
-                    FilePath = filePath,
-                    JobId = jobId,
-                    PrintLocation = printFlag
-                });
-        
-                await Task.CompletedTask; // To preserve async signature
+                    if (_isShutdownInitiated)
+                        throw new InvalidOperationException("PrinterService is shutting down.");
 
-                //if (printFlag == "N")
-                //{
-                //    printer = await _dataAccess.GetPrinterSettingByShortNameAsync(printerName);
+                    printerName = printerName.Trim();
 
-                //    if (printer == null)
-                //    {
-                //        _logger.LogError($"Printer with name {printerName} not found.");
-                //        throw new Exception($"Printer with name {printerName} not found.");
-                //    }
-                //}
+                    var channel = _printerChannels.GetOrAdd(printerName, pn => StartPrinterWorker(pn));
 
-                //// Fetch the job details by jobId instead of filePath
-                //var job = await _dataAccess.GetJobByIdAsync(jobId);  // Use jobId instead of filePath
+                    var job = new PrintJob
+                    {
+                        PrinterName = printerName,
+                        FilePath = filePath,
+                        JobId = jobId,
+                        PrintLocation = printFlag,
+                        WorkOrderId = workOrderId,
+                        Sequence = sequence,
+                        Objtyp = objtyp
+                    };
 
-                //if (job == null)
-                //{
-                //    _logger.LogError($"Job with ID {jobId} not found.");
-                //    throw new Exception($"Job with ID {jobId} not found.");
-                //}
-
-                //// If the Print flag is L, do a local print and exit
-                //if (string.Equals(printFlag, "L", StringComparison.OrdinalIgnoreCase))
-                //{
-                //    await LocalPrintAsync(printerName, filePath, job.Duplex);
-                   
-                //    return;
-                //}
-
-                //// Determine the print method based on the printer settings
-                //if (await IsGeneratePdfOnlyAsync(printer.Id))
-                //{
-                //    _logger.LogInformation($"PDF already generated for file: {filePath}, no printing required.");
-                //    return;
-                //}
-                //else if (await IsDirectPrintToIpAsync(printer.Id))
-                //{
-                //    await DirectPrintToIpAsync(printer, filePath, job.Duplex);
-                //}
-                //else if (await IsDirectPrintWithStaplingAsync(printer.Id))
-                //{
-                //    await DirectPrintWithStaplingAsync(printer, filePath, job.Duplex);
-                //}
-                //else if (await IsPrintToQueueAsync(printer.Id))
-                //{
-                //    await PrintToQueueAsync(printer, filePath, job.Print, job.Duplex);
-                //}
-                //else
-                //{
-                //    _logger.LogWarning($"No valid print method found for printer {printer.Name} and job {jobId}.");
-                //}
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"An error occurred while printing file: {filePath} for job: {jobId}");
-                throw;
-            }
+                    await channel.Writer.WriteAsync(job);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Error while enqueuing print job for {PrinterName}", printerName);
+                }
+            });
         }
+
 
         /// <summary>
         /// Processes and prints a single job.
@@ -181,64 +136,60 @@ namespace PrintPlusService.Services
         {
             try
             {
-                PrinterSetting printer = null;
-
-                if (printLocation == "N")
-                {
-                    printer = await _dataAccess.GetPrinterSettingByShortNameAsync(printerName);
-
-                    if (printer == null)
-                    {
-                        _logger.LogError($"Printer with name {printerName} not found.");
-                        throw new Exception($"Printer with name {printerName} not found.");
-                    }
-                }
-
-                // Fetch the job details by jobId instead of filePath
-                var job = await _dataAccess.GetJobByIdAsync(jobId);  // Use jobId instead of filePath
-
+                // Fetch the job early
+                var job = await _dataAccess.GetJobByIdAsync(jobId);
                 if (job == null)
                 {
-                    _logger.LogError($"Job with ID {jobId} not found.");
-                    throw new Exception($"Job with ID {jobId} not found.");
+                    _logger.LogError($"Job with ID '{jobId}' not found.");
+                    throw new Exception($"Job with ID '{jobId}' not found.");
                 }
 
-                // If the Print flag is L, do a local print and exit
-                if (string.Equals(printLocation, "L", StringComparison.OrdinalIgnoreCase) || 
-                    string.Equals(printLocation, "E", StringComparison.OrdinalIgnoreCase) || 
-                    string.Equals(printLocation, "S", StringComparison.OrdinalIgnoreCase))
+                // Early exit for local or special print types
+                switch (printLocation?.ToUpperInvariant())
                 {
-                    await LocalPrintAsync(printerName, filePath, job.Duplex);
+                    case "L":
+                    case "E":
+                    case "S":
+                        await LocalPrintAsync(printerName, filePath, job.Duplex);
+                        return;
+                }
 
+                // Only fetch printer info if required
+                var printer = await _dataAccess.GetPrinterSettingByShortNameAsync(printerName);
+                if (printer == null)
+                {
+                    _logger.LogError($"Printer with name '{printerName}' not found.");
+                    //throw new Exception($"Printer with name '{printerName}' not found.");
+                }
+
+                var printerId = printer.Id;
+
+                if (await IsGeneratePdfOnlyAsync(printerId))
+                {
+                    _logger.LogInformation($"PDF only: skipping print for file '{filePath}'.");
                     return;
                 }
 
-                // Determine the print method based on the printer settings
-                if (await IsGeneratePdfOnlyAsync(printer.Id))
-                {
-                    _logger.LogInformation($"PDF already generated for file: {filePath}, no printing required.");
-                    return;
-                }
-                else if (await IsDirectPrintToIpAsync(printer.Id))
+                if (await IsDirectPrintToIpAsync(printerId))
                 {
                     await DirectPrintToIpAsync(printer, filePath, job.Duplex);
                 }
-                else if (await IsDirectPrintWithStaplingAsync(printer.Id))
+                else if (await IsDirectPrintWithStaplingAsync(printerId))
                 {
                     await DirectPrintWithStaplingAsync(printer, filePath, job.Duplex);
                 }
-                else if (await IsPrintToQueueAsync(printer.Id))
+                else if (await IsPrintToQueueAsync(printerId))
                 {
                     await PrintToQueueAsync(printer, filePath, job.Print, job.Duplex);
                 }
                 else
                 {
-                    _logger.LogWarning($"No valid print method found for printer {printer.Name} and job {jobId}.");
+                    _logger.LogWarning($"No matching print method for printer '{printer.Name}' and job '{jobId}'.");
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"An error occurred while printing file: {filePath} for job: {jobId}");
+                _logger.LogError(ex, $"Error printing '{filePath}' for job '{jobId}'.");
                 throw;
             }
         }
@@ -248,64 +199,189 @@ namespace PrintPlusService.Services
         /// </summary>
         public async Task ShutdownAsync()
         {
+            _logger.LogInformation("Shutdown initiated...");
+
             _isShutdownInitiated = true;
             _shutdownTokenSource.Cancel();
 
-            // Mark all queues as "complete for adding", so worker tasks can finish
-            foreach (var queue in _printerQueues.Values)
-                queue.CompleteAdding();
+            // Signal all channels to complete
+            foreach (var kvp in _printerChannels)
+            {
+                var printerName = kvp.Key;
+                _logger.LogInformation("Completing print channel for printer: {PrinterName}", printerName);
+                kvp.Value.Writer.TryComplete();
+            }
 
-            // Wait for all workers to finish
+            // Wait for worker tasks to finish
             try
             {
                 await Task.WhenAll(_workerTasks);
+                _logger.LogInformation("All printer worker tasks have completed.");
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("Shutdown was canceled during wait.");
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error while shutting down printer workers.");
             }
+
+            _logger.LogInformation("PrinterService shutdown complete.");
         }
 
 
-        /// <summary>
-        /// Starts a background worker for a printer's job queue.
-        /// The worker will process jobs from the queue until shutdown is signaled.
-        /// </summary>
-        private BlockingCollection<PrintJob> StartPrinterWorker(string printerName)
+        private Channel<PrintJob> StartPrinterWorker(string printerName)
         {
-            var queue = new BlockingCollection<PrintJob>();
+            var channel = Channel.CreateUnbounded<PrintJob>(new UnboundedChannelOptions
+            {
+                SingleWriter = true,
+                SingleReader = true
+            });
+
             var ct = _shutdownTokenSource.Token;
 
-            // Worker task that runs as long as not cancelled
-            var workerTask = Task.Run(async () =>
+            var task = Task.Run(() => ProcessQueueAsync(channel, printerName, ct), ct);
+
+            _workerTasks.Add(task);
+
+            return channel;
+        }
+
+        // Adjusted ProcessQueueAsync signature
+        private async Task ProcessQueueAsync(Channel<PrintJob> channel, string printerName, CancellationToken ct)
+        {
+            var printLock = _printerLocks.GetOrAdd(printerName, _ => new SemaphoreSlim(1, 1));
+
+            try
             {
-                try
+                await foreach (var job in channel.Reader.ReadAllAsync(ct))
                 {
-                    // Take jobs from the queue and process them
-                    foreach (var job in queue.GetConsumingEnumerable(ct))
+                    if (job == null)
                     {
-                        try
+                        _logger?.LogWarning("Received null job in channel for printer {PrinterName}", printerName);
+                        continue;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(job.JobId) ||
+                        string.IsNullOrWhiteSpace(job.WorkOrderId) ||
+                        string.IsNullOrWhiteSpace(job.Sequence) ||
+                        string.IsNullOrWhiteSpace(job.Objtyp))
+                    {
+                        _logger?.LogWarning("Invalid PrintJob: One or more required fields are missing. JobId={JobId}, WorkOrderId={WorkOrderId}, Sequence={Sequence}, Objtyp={Objtyp}",
+                            job?.JobId, job?.WorkOrderId, job?.Sequence, job?.Objtyp);
+                        continue;
+                    }
+
+                    await printLock.WaitAsync(ct);
+
+                    try
+                    {
+                        // Check for printer issues before print
+                        //PrinterIssue issue;
+
+                        //int issueCheckAttempts = 0;
+                        //const int maxIssueChecks = 20;
+
+                        //do
+                        //{
+                        //    issue = _printerStatusChecker.CheckPrinterStatus(job.PrinterName);
+
+                        //    if (issue == PrinterIssue.OutOfPaper || issue == PrinterIssue.Jammed)
+                        //    {
+                        //        _logger?.LogWarning("Printer {PrinterName} has issue: {Issue}. Pausing job {JobId} until resolved... (Attempt {Attempt})", job.PrinterName, issue, job.JobId, issueCheckAttempts + 1);
+                        //        await Task.Delay(TimeSpan.FromSeconds(30), ct);
+                        //        issueCheckAttempts++;
+                        //    }
+
+                        //    if (issueCheckAttempts >= maxIssueChecks)
+                        //    {
+                        //        _logger?.LogError("Printer {PrinterName} still has issue ({Issue}) after waiting too long. Skipping job {JobId}.", job.PrinterName, issue, job.JobId);
+                        //        break;
+                        //    }
+                        //}
+                        //while ((issue == PrinterIssue.OutOfPaper || issue == PrinterIssue.Jammed) && !ct.IsCancellationRequested);
+
+                        //if (issue == PrinterIssue.OutOfPaper || issue == PrinterIssue.Jammed)
+                        //{
+                        //    continue; // skip this job for now
+                        //}
+
+                        const int maxImmediateRetries = 5;
+                        const int delayBetweenRetriesMs = 5000;
+
+                        bool success = false;
+
+                        // Immediate retry loop
+                        for (int attempt = 1; attempt <= maxImmediateRetries && !success; attempt++)
                         {
-                            await PrintFileInternalAsync(job.PrinterName, job.FilePath, job.JobId, job.PrintLocation);
+                            try
+                            {
+                                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+                                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+                                await PrintFileInternalAsync(job.PrinterName, job.FilePath, job.JobId, job.PrintLocation);
+                                success = true;
+
+                               // _logger?.LogInformation("Print succeeded for WorkOrder {WorkOrderId} on attempt {Attempt}", job.WorkOrderId, attempt);
+                            }
+                            catch (OperationCanceledException ocex) when (!ct.IsCancellationRequested)
+                            {
+                                _logger?.LogWarning(ocex, "Print timeout on attempt {Attempt} for job {JobId} on printer {PrinterName}. Please check printer!", attempt, job.JobId, job.PrinterName);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger?.LogWarning(ex, "Print failed on attempt {Attempt} for job {JobId} on printer {PrinterName}", attempt, job.JobId, job.PrinterName);
+                            }
+
+                            if (!success && attempt < maxImmediateRetries)
+                            {
+                                _logger?.LogInformation("Waiting {Delay}ms before retrying job {JobId} on printer {PrinterName}", delayBetweenRetriesMs, job.JobId, job.PrinterName);
+                                await Task.Delay(delayBetweenRetriesMs, ct);
+                            }
                         }
-                        catch (Exception ex)
+
+                        //                ////Re - enqueue happens here if still unsuccessful
+                        //                //if (!success)
+                        //                //{
+                        //                //    job.RetryCount++;
+
+                        //                //    if (job.RetryCount < maxTotalRetries)
+                        //                //    {
+                        //                //        _logger?.LogWarning("Re-enqueuing job {JobId} for retry #{RetryCount} on printer {PrinterName}", job.JobId, job.RetryCount, job.PrinterName);
+
+                        //                //        await Task.Delay(2000, ct); // brief cooldown before requeue
+
+                        //                //        var printerChannel = _printerChannels[job.PrinterName];
+                        //                //        await printerChannel.Writer.WriteAsync(job, ct);
+                        //                //    }
+                        //                //    else
+                        //                //    {
+                        //                //        _logger?.LogError("Max retry limit reached. Giving up on job {JobId} on printer {PrinterName}", job.JobId, job.PrinterName);
+                        //                //        // Optional: persist to DB or alert
+                        //                //        // await _dataAccess.SaveFailedPrintJobAsync(job);
+                        //                //    }
+                        //                //}
+
+                        if (!success)
                         {
-                            _logger.LogError(ex, $"Error printing job {job.JobId} on printer {job.PrinterName}");
+                            _logger?.LogError("All retries failed for job {JobId} on printer {PrinterName}", job.JobId, job.PrinterName);
                         }
                     }
+                    finally
+                    {
+                        printLock.Release();
+                    }
                 }
-                catch (OperationCanceledException)
-                {
-                    // Expected during shutdown, ignore
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, $"Background worker for printer {printerName} exited with error.");
-                }
-            }, ct);
-
-            _workerTasks.Add(workerTask);
-            return queue;
+            }
+            catch (OperationCanceledException)
+            {
+                _logger?.LogInformation("Print channel processing was cancelled for printer {PrinterName}", printerName);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Unexpected error while processing the print job channel for printer {PrinterName}", printerName);
+            }
         }
 
         private async Task LocalPrintAsync(string printer, string filePath, string duplex)
@@ -434,8 +510,8 @@ namespace PrintPlusService.Services
         {
             try
             {
-                _logger.LogInformation("Printing to the printer queue.");
-                SendFileToPrinter(printer.PrintQueue, filePath, false, duplex);
+               // _logger.LogInformation("Sending print job to printer queue for processing.");
+                await SendFileToPrinter(printer.PrintQueue, filePath, false, duplex);
             }
             catch (Exception ex)
             {
@@ -498,13 +574,13 @@ namespace PrintPlusService.Services
         /// <param name="duplex">The duplex setting for the print job (e.g., simplex or duplex).</param>
         /// <exception cref="PlatformNotSupportedException">Thrown if the platform is not supported for printing.</exception>
 
-        protected virtual void SendFileToPrinter(string printQueue, string filePath, bool staple, string duplex)
+        protected virtual async Task SendFileToPrinter(string printQueue, string filePath, bool staple, string duplex)
         {
             try
             {
                 //#if WINDOWS
                 if (OperatingSystem.IsWindows())
-                    PrintFileOnWindows(printQueue, filePath, staple, duplex);
+                    await PrintFileOnWindows(printQueue, filePath, staple, duplex);
                 //#elif LINUX
                 //else
                 //    throw new PlatformNotSupportedException("Printing is only supported on Windows and Linux.");
@@ -535,167 +611,52 @@ namespace PrintPlusService.Services
         /// <exception cref="Exception">Thrown if an error occurs during the printing process.</exception>
 
         [SupportedOSPlatform("windows")]
-        private void PrintFileOnWindows(string printQueue, string filePath, bool staple, string duplex)
+        private async Task PrintFileOnWindows(string printQueue, string filePath, bool staple, string duplex)
         {
+            //var printLock = GetPrinterLock(printQueue);
+            //await printLock.WaitAsync(_cts);
+
             try
             {
                 if (!File.Exists(filePath))
-                {
                     throw new FileNotFoundException("File not found", filePath);
-                }
-
-                //PrintDocument printDocument = new PrintDocument
-                //{
-                //    //PrinterSettings = { PrinterName = "PR02" }
-                //    PrinterSettings = { PrinterName = printQueue }
-                //};
-
-                //printDocument.PrintPage += (sender, e) =>
-                //{
-                //    using (StreamReader reader = new StreamReader(filePath))
-                //    {
-                //        string fileContent = reader.ReadToEnd();
-                //        e.Graphics.DrawString(fileContent, new Font("Arial", 10), Brushes.Black, new RectangleF(0, 0, printDocument.DefaultPageSettings.PrintableArea.Width, printDocument.DefaultPageSettings.PrintableArea.Height));
-                //    }
-
-                //    if (staple)
-                //    {
-                //        AddStaples(filePath, duplex == "D");
-                //    }
-                //};
-
-                //printDocument.PrinterSettings.Duplex = duplex == "D" ? Duplex.Vertical : Duplex.Simplex;
-                //printDocument.Print();
-
-                //Load the PDF document
-                //pdfDocument = PdfDocument.Load(filePath);
-
-                //using (PrintDocument printDocument = new PrintDocument())
-                //{
-                //    printDocument.PrinterSettings = new PrinterSettings
-                //    {
-                //        PrinterName = printQueue,
-                //    };
-
-                //    if (staple)
-                //    {
-                //        AddStaples(filePath, duplex == "D");
-                //    }
-
-                //    printDocument.PrinterSettings.Duplex = duplex == "D" ? Duplex.Vertical : Duplex.Simplex;
-
-                //    // Attach the PrintPage event handler
-                //    printDocument.PrintPage += PrintDocument_PrintPage;
-
-                //    // Start printing
-                //    printDocument.Print();
-                //}
-
-                //pdfDocument.Dispose();
 
                 if (staple)
-                {
                     AddStaples(filePath, duplex == "D");
-                }
 
-                // Handle duplex mode
                 string duplexOption = duplex == "D" ? "duplex" : "";
-                string printerName = printQueue; // Set your printer name
-                string pdfFilePath = filePath;
+                string arguments = $"-print-to \"{printQueue}\" -silent -print-settings \"{duplexOption}\" \"{filePath}\"";
 
-                
-                //string arguments = $"-print-to \"{printerName}\" -silent -print-settings\"{duplexOption}\" -readonly \"{pdfFilePath}\"";
-                string arguments = $"-print-to \"{printerName}\" -silent -print-settings \"{duplexOption}\" \"{pdfFilePath}\"";
-                ProcessStartInfo psi = new ProcessStartInfo
+                var psi = new ProcessStartInfo
                 {
-                    FileName = @"C:\PM11\Tools\SumatraPDF.exe", // Path to SumatraPDF
+                    FileName = @"C:\PM11\Tools\SumatraPDF.exe",
                     Arguments = arguments,
-                    UseShellExecute = true,
+                    UseShellExecute = false,
                     CreateNoWindow = true
                 };
 
-                try
-                {
-                    Task.Run(() =>
-                    {
-                        try
-                        {
-                            using (Process process = Process.Start(psi))
-                            {
-                                process.WaitForExitAsync();
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError($"Silent Printing Error in background task: {ex.Message}");
-                        }
-                    });
+                using var process = Process.Start(psi);
 
-                    // Continue to next operation without waiting
-                    //_logger.LogInformation("Print command sent, continuing to next task.");
-                }
-                catch (System.Exception ex)
+                if (process == null)
                 {
-                    _logger.LogError("Silent Printing Error: " + ex.Message);
+                    _logger?.LogError("Failed to start SumatraPDF for {FilePath}", filePath);
+                    return;
                 }
+
+                await process.WaitForExitAsync(_cts);
+   
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Error in PrintFileOnWindows: {ex.Message}");
+                _logger.LogError(ex, $"Error printing file {filePath} to printer {printQueue}");
                 throw;
+            }
+            finally
+            {
+                //printLock.Release();
             }
         }
 
-        //[SupportedOSPlatform("windows")]
-        //private static void PrintDocument_PrintPage(object sender, PrintPageEventArgs e)
-        //{
-        //    if (currentPage >= pdfDocument.Pages.Count)
-        //    {
-        //        e.HasMorePages = false;
-        //        return;
-        //    }
-
-        //    //float scale = 100f / 72f; // Convert PDF points (72 DPI) to target DPI
-
-        //    //// Calculate scaled dimensions
-        //    //int width = (int)(e.PageBounds.Width * scale);
-        //    //int height = (int)(e.PageBounds.Height * scale);
-
-        //    // Create high-quality bitmap
-        //    using (var bitmap = new Bitmap(e.PageBounds.Width, e.PageBounds.Height, PixelFormat.Format32bppArgb))
-        //    {
-        //        using (Graphics g = Graphics.FromImage(bitmap))
-        //        {
-        //            g.Clear(Color.White); // Set background color
-
-        //            // Enable high-quality rendering settings
-        //            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-        //            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-        //            g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
-
-        //            // Render PDF to Graphics (ensure HDC is released)
-        //            IntPtr hdc = g.GetHdc();
-        //            try
-        //            {
-        //                pdfDocument.Pages[currentPage].Render(hdc, 0, 0, e.PageBounds.Width, e.PageBounds.Height, PageRotate.Normal, 
-        //                    RenderFlags.FPDF_NO_NATIVETEXT);
-        //            }
-        //            finally
-        //            {
-        //                g.ReleaseHdc(hdc);
-        //            }
-        //        }
-
-        //        // Draw the high-quality bitmap onto the printer graphics
-        //        e.Graphics.DrawImage(bitmap, new RectangleF(0, 0, e.PageBounds.Width, e.PageBounds.Height));
-        //    }
-
-        //    // Move to next page
-        //    currentPage++;
-        //    e.HasMorePages = currentPage < pdfDocument.Pages.Count;
-        //}
-
-   
         /// <summary>
         /// Handles the printing of a file on a Linux system, using the "lp" command to send the file to the printer.
         /// </summary>
@@ -703,7 +664,6 @@ namespace PrintPlusService.Services
         /// <param name="filePath">The path to the file to be printed.</param>
         /// <exception cref="FileNotFoundException">Thrown if the specified file does not exist.</exception>
         /// <exception cref="Exception">Thrown if an error occurs during the printing process.</exception>
-
         private void PrintFileOnLinux(string printQueue, string filePath)
         {
             try
@@ -922,6 +882,7 @@ namespace PrintPlusService.Services
         /// <summary>
         /// Dispose pattern implementation for releasing resources.
         /// Ensures all workers are stopped gracefully.
+        /// </summary>
         /// </summary>
         public void Dispose()
         {

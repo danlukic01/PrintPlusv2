@@ -74,7 +74,7 @@ public class DataAccess : IDataAccess
         using var context = _context.CreateDbContext();
         //var _context = scope.ServiceProvider.GetRequiredService<PrintPlusContext>();
 
-        _logger.LogInformation($"Updating status for WorkOrderPart with WorkOrderId: {workOrderId}, PartId: {partId} to {status}");
+    //    _logger.LogInformation($"Updating status for WorkOrderPart with WorkOrderId: {workOrderId}, PartId: {partId} to {status}");
          var workOrderParts = await context.WorkOrderParts
              .Where(part => part.UniqueJobId == uniqueJobId && part.WorkOrderId == workOrderId && part.PartId == partId)
              .ToListAsync();
@@ -91,7 +91,11 @@ public class DataAccess : IDataAccess
                      workOrderPart.ErrorMessage = errorMessage;
                  }
 
-                 context.WorkOrderParts.Update(workOrderPart);
+                // Override incorrect Error tagging even if the job was processed without issues
+                if (status == "Error" && string.IsNullOrEmpty(errorMessage))
+                    workOrderPart.Status = "Processed";
+
+                context.WorkOrderParts.Update(workOrderPart);
              }
 
             if (_useSqlServer)
@@ -286,7 +290,7 @@ public class DataAccess : IDataAccess
                 });
             }
             context.Entry(workOrderPart).State = EntityState.Detached; // Detach entity after adding
-            _logger.LogInformation($"WorkOrderPart with ID {workOrderPart.PartId} for WorkOrder ID {workOrderPart.WorkOrderId} and Unique jobID {workOrder.UniqueJobId} added to the database.");
+            //_logger.LogInformation($"WorkOrderPart with ID {workOrderPart.PartId} for WorkOrder ID {workOrderPart.WorkOrderId} and Unique jobID {workOrder.UniqueJobId} added to the database.");
         }
         else
         {
@@ -554,6 +558,10 @@ public class DataAccess : IDataAccess
                 job.ErrorMessage = errorMessage;
             }
 
+            // Override incorrect Error tagging even if the job was processed without issues
+            if (status == "Error" && string.IsNullOrEmpty(errorMessage))
+                job.Status = "Processed";
+
             context.Jobs.Update(job);
 
             if (_useSqlServer)
@@ -634,7 +642,7 @@ public class DataAccess : IDataAccess
         using var context = _context.CreateDbContext();
         //var context = scope.ServiceProvider.GetRequiredService<PrintPlusContext>();
 
-        _logger.LogInformation($"Updating status for WorkOrder with WorkOrderId: {workOrderId} to {status}");
+    //    _logger.LogInformation($"Updating status for WorkOrder with WorkOrderId: {workOrderId} to {status}");
 
         var workOrder = await context.WorkOrders
                                       .Where(wo => wo.UniqueJobId == uniqueJobId && wo.WorkOrderId == workOrderId)
@@ -653,6 +661,12 @@ public class DataAccess : IDataAccess
             {
                 workOrder.ErrorMessage = errorMessage;
             }
+
+            // Override incorrect Error tagging even if the job was processed without issues
+            if (status == "Error" && string.IsNullOrEmpty(errorMessage))
+                workOrder.Status = "Processed";
+
+
             if (_useSqlServer)
             {
                 await context.SaveChangesAsync();
@@ -666,7 +680,7 @@ public class DataAccess : IDataAccess
                     
                 });
             }
-            _logger.LogInformation($"Updated WorkOrder status to {status} for WorkOrderId {workOrderId}");
+           // _logger.LogInformation($"Updated WorkOrder status to {status} for WorkOrderId {workOrderId}");
         }
         else
         {
@@ -1092,7 +1106,7 @@ public class DataAccess : IDataAccess
         using var context = _context.CreateDbContext();
         //var context = scope.ServiceProvider.GetRequiredService<PrintPlusContext>();
 
-        _logger.LogInformation("Retrieving all RFC settings from the database.");
+       // _logger.LogInformation("Retrieving all RFC settings from the database.");
         return await context.RFCSettings.ToListAsync();
     }
 
@@ -1326,7 +1340,14 @@ public class DataAccess : IDataAccess
 
         // Queries the Users table to find a user with the specified username.
         // Returns a single User object if found, otherwise returns null.
-        return await context.Users.SingleOrDefaultAsync(u => u.Username == username);
+        try
+        {
+            return await context.Users.SingleOrDefaultAsync(u => u.Username == username.Trim());
+        }
+        catch (Exception ex)
+        {
+            throw new Exception(ex.Message + ex.InnerException);
+        }
     }
 
     /// <summary>

@@ -13,8 +13,8 @@ namespace PrintPlusService.Services
         /// <param name="jobId">The job ID associated with the print job.</param>
         /// <param name="printFlag">The location to send the print Local or Network.</param>
         /// <returns>A task representing the asynchronous print operation.</returns>
-        Task PrintFileAsync(string printerName, string filePath, string jobId, string printFlag);
-
-      
+        void PrintFileAsync(string printerName, string filePath, string jobId, string printFlag, string workOrderId, string sequence, string objtyp);
+        //    void CollectPrintJob(string printerName, string filePath, string jobId, string printFlag, string workOrderId, string sequence, string objtyp, int fileCount);
+       
     }
 }

@@ -109,247 +109,427 @@ namespace PrintPlusService.Services
         /// <param name="jobInfo">An object containing details about the job, such as Job ID, work order ID, and sequence number.</param>
         /// <param name="cancellationToken">Token for handling task cancellation requests.</param>
         /// <exception cref="Exception">Logs errors during file preparation or SAP RFC communication.</exception>
-
         public async Task UpdateStatusAsync(JobInfo jobInfo, CancellationToken cancellationToken)
-    {
-        _logger.LogInformation($"Preparing to update SAP status for JobId={jobInfo.JobId}, Wo={jobInfo.Wo}");
-
-        try
         {
-            // Retrieve RFC settings from the database
-            var rfcSettings = await _dataAccess.GetRFCSettingsAsync();
-            if (rfcSettings == null || rfcSettings.Count == 0)
+            //_logger.LogInformation($"Preparing to update SAP status for JobId={jobInfo.JobId}, Wo={jobInfo.Wo}");
+
+            try
             {
-                _logger.LogError(null, "No RFC settings found in the database.");
-                return;
-            }
+                // Fetch all config/settings in parallel
+                var rfcTask = _dataAccess.GetRFCSettingsAsync();
+                var envTask = _dataAccess.GetConfigurationSettingAsync("AppSettings", "Environment");
+                var folderTask = _dataAccess.GetSapFolderSettingsAsync();
 
-            var settings = rfcSettings.FirstOrDefault();
-            if (settings == null)
-            {
-                _logger.LogError(null, "Could not retrieve valid RFC settings from the database.");
-                return;
-            }
 
-            // Retrieve the current environment setting
-            var environmentSetting = await _dataAccess.GetConfigurationSettingAsync("AppSettings", "Environment");
-            if (environmentSetting == null)
-            {
-                _logger.LogError(null, "Environment configuration not found.");
-                return;
-            }
+                await Task.WhenAll(rfcTask, envTask, folderTask);
 
-            // Retrieve SAP Folder Settings from the database
-            var sapFolderSettings = await _dataAccess.GetSapFolderSettingsAsync();
-            var sapFolder = sapFolderSettings.FirstOrDefault(s => s.Name == environmentSetting.Value);
-            if (sapFolder == null)
-            {
-                _logger.LogError(null, $"No SAP folder settings found for environment {environmentSetting.Value}.");
-                return;
-            }
+                var rfcSettings = rfcTask.Result;
+                var environmentSetting = envTask.Result;
+                var sapFolderSettings = folderTask.Result;
 
-            // Ensure jobId is padded with leading zeros (assuming 10 digits)
-            string paddedJobId = jobInfo.JobId.PadLeft(10, '0');
+                if (rfcSettings == null || rfcSettings.Count == 0)
+                {
+                    _logger.LogError(null, "No RFC settings found in the database.");
+                    return;
+                }
 
-            // Construct file path based on the status type (037 for work order, 007 for job)
-            string sapPath = sapFolder.SapPath;
-            string environmentFolder = environmentSetting.Value;
-            string outPath = string.Empty;
-            string loutPath = string.Empty;
-            string filePath = string.Empty;
+                var settings = rfcSettings.FirstOrDefault();
+                if (settings == null)
+                {
+                    _logger.LogError(null, "Could not retrieve valid RFC settings from the database.");
+                    return;
+                }
 
-            // Map status "009" to a valid SAP-compatible status
-            string effectiveStatus = jobInfo.Msg == "009"
-                ? (jobInfo.Wo.Length < 5 ? "007" : "037")
-                : jobInfo.Msg;
+                if (environmentSetting == null)
+                {
+                    _logger.LogError(null, "Environment configuration not found.");
+                    return;
+                }
 
-                //if (jobInfo.Msg == "037")
-                //{
-                //    // Ensure Wo (work order) is padded with leading zeros (12 digits) for 037 status
-                //    string paddedWo = jobInfo.Wo.PadLeft(12, '0');
-                //    outPath = $"{sapPath}/{environmentFolder}/Out/{paddedJobId}/{paddedWo}.pdf";  // Work order file
-                //    loutPath = $"{environmentFolder}\\Out\\{paddedJobId}\\{paddedWo}.pdf";  // Work order file'
-                   
-                //}
-                //else if (jobInfo.Msg == "007")  // Job complete
-                //{
-                //    // For job complete status, pad Aufnr with 20 zeros
-                //    outPath = $"{sapPath}/{environmentFolder}/Out/{paddedJobId}/{paddedJobId}.pdf";  // Job file
-                //    loutPath = $"{environmentFolder}\\Out\\{paddedJobId}\\{paddedJobId}.pdf";  // Job file
-                //    filePath = System.IO.Path.Combine(sapFolder.Path, loutPath);
-                //}
-                //else if (jobInfo.Msg == "009")  // Printing disabled by configuration
-                //{
-                //    // for errors, use exactly the file the caller provided
-                //    filePath = jobInfo.File;
-                //}
-                //else
-                //{
-                //    _logger.LogWarning($"Unknown status code {jobInfo.Msg} for JobId={jobInfo.JobId}. No valid file path generated.");
-                //    return;
-                //}
+                var sapFolder = sapFolderSettings.FirstOrDefault(s => s.Name == environmentSetting.Value);
+                if (sapFolder == null)
+                {
+                    _logger.LogError(null, $"No SAP folder settings found for environment {environmentSetting.Value}.");
+                    return;
+                }
+
+                string paddedJobId = jobInfo.JobId.PadLeft(10, '0');
+                string paddedWo = jobInfo.Wo.PadLeft(12, '0');
+                string environmentFolder = environmentSetting.Value;
+                string outPath = string.Empty;
+               
+
+                string effectiveStatus = jobInfo.Msg == "009"
+                    ? (jobInfo.Wo.Length < 5 ? "007" : "037")
+                    : jobInfo.Msg;
+
+                // Determine file path
+                string filePath = effectiveStatus switch
+                {
+                    "037" => System.IO.Path.Combine(sapFolder.Path, $"{environmentFolder}\\Out\\{paddedJobId}\\{paddedWo}.pdf"),
+                    "007" => System.IO.Path.Combine(sapFolder.Path, $"{environmentFolder}\\Out\\{paddedJobId}\\{paddedJobId}.pdf"),
+                    "009" => jobInfo.File,
+                    _ => null
+                };
 
                 if (effectiveStatus == "037")
-                {
-                    string paddedWo = jobInfo.Wo.PadLeft(12, '0');
-                    outPath = $"{sapPath}/{environmentFolder}/Out/{paddedJobId}/{paddedWo}.pdf";
-                    loutPath = $"{environmentFolder}\\Out\\{paddedJobId}\\{paddedWo}.pdf";
-                    filePath = System.IO.Path.Combine(sapFolder.Path, loutPath);
-                }
+                    outPath = $"{sapFolder.SapPath}/{environmentFolder}/Out/{paddedJobId}/{paddedWo}.pdf";
                 else if (effectiveStatus == "007")
+                    outPath = $"{sapFolder.SapPath}/{environmentFolder}/Out/{paddedJobId}/{paddedJobId}.pdf";
+
+
+                if (string.IsNullOrWhiteSpace(filePath))
                 {
-                    outPath = $"{sapPath}/{environmentFolder}/Out/{paddedJobId}/{paddedJobId}.pdf";
-                    loutPath = $"{environmentFolder}\\Out\\{paddedJobId}\\{paddedJobId}.pdf";
-                    filePath = System.IO.Path.Combine(sapFolder.Path, loutPath);
+                    _logger.LogWarning($"Unknown status code {jobInfo.Msg} for JobId={jobInfo.JobId}. No valid file path generated.");
+                    return;
                 }
 
-                //if (jobInfo.Msg == "009")  // Printing disabled by configuration
-                //{
-                //    // for errors, use exactly the file the caller provided
-                //    filePath = jobInfo.File;
-                //}
-                //else
-                //{
-                //    _logger.LogWarning($"Unknown status code {jobInfo.Msg} for JobId={jobInfo.JobId}. No valid file path generated.");
-                //    return;
-                //}
-
-
-                // Use the local path and files for processing
-
-                filePath = System.IO.Path.Combine(sapFolder.Path, loutPath);
-
-                if (jobInfo.Msg == "009")  // Printing disabled by configuration
-                {
-                    // for errors, use exactly the file the caller provided
-                    filePath = jobInfo.File;
-                }
-
-
-                // Ensure file is ready before proceeding
                 if (!await WaitForFileExistsAsync(filePath, cancellationToken))
-            {
-                _logger.LogError(null, $"File is not ready or locked after retries: {filePath}");
-                return;  // Exit if the file is not available
-            }
+                {
+                    _logger.LogError(null, $"File is not ready or locked after retries: {filePath}");
+                    return;
+                }
 
-            // Retrieve the file size in bytes
-            var fileInfo = new FileInfo(filePath);
-            File.SetAttributes(filePath, FileAttributes.Normal);
-            long fileSizeBytes = fileInfo.Length;
-            _logger.LogInformation($"File size (bytes): {fileSizeBytes} for {filePath}");
+                var fileInfo = new FileInfo(filePath);
+                File.SetAttributes(filePath, FileAttributes.Normal);
+                long fileSizeBytes = fileInfo.Length;
 
+                _logger.LogInformation($"File size (bytes): {fileSizeBytes} for {filePath}");
 
-            // Proceed with SAP RFC call after file is ready
-            using (var connection = new RfcConnection(new RfcConnectionParameterBuilder()
+                using (var connection = new RfcConnection(new RfcConnectionParameterBuilder()
                     .UseConnectionHost(settings.MSHOST)
                     .UseLogonUserName(settings.User)
                     .UseLogonPassword(settings.Password)
                     .UseLogonClient(settings.CLIENT.ToString())
                     .UseLogonLanguage(settings.LogonLang)
                     .UseSystemNumber(settings.SYSNR.ToString())))
-            {
-    
-                //_logger.LogInformation("Attempting to establish a connection to SAP RFC.");
-
-                connection.Open();
-                _logger.LogInformation("Successfully connected to SAP.");
-
-                using (var rfcFunction = connection.CallRfcFunction("/ZPM/WO2PDF2_RECEIVE"))
                 {
-                    // Determine message type based on the job status
-                    string messageType = jobInfo.Msg switch
-                    {
-                        "037" => "I",  // Work order 
-                        "007" => "I",  // Job 
-                        "005" => "E",  // File to be printed doesn’t exist
-                        "009" => "E",  // Printing disabled by configuration
-                        _ => "E",      // Default to error
-                    };
+                    connection.Open();
+                    //_logger.LogInformation("Successfully connected to SAP.");
 
-                        //Prepare the ReceiveStatusIt object
-                        //var receiveStatus = new ReceiveStatusIt
-                        //{
-                        //    ItReceiveStatus = new[]
-                        //    {
-                        //         new Wo2Pdf2ReceiveStatusI
-                        //         {
-                        //             //Aufnr = jobInfo.Msg == "037" || jobInfo.Msg == "009"
-                        //             Aufnr = jobInfo.Msg == "037"
-                        //                 ? jobInfo.Wo?.PadLeft(20, '0') ?? string.Empty  // For status 037, pad Wo to 20 digits
-                        //                 : new string('0', 20),                          // For status 007, send 20 zeros
-                        //             Vornr = jobInfo.Sequence?.Length > 4
-                        //                 ? jobInfo.Sequence.Substring(jobInfo.Sequence.Length - 4)  // Truncate to the last 4 characters
-                        //                 : jobInfo.Sequence?.PadLeft(4, '0') ?? string.Empty,  // Pad with leading zeros if less than 4 characters
-                        //             Objtyp = "BUS2007",
-                        //             Wo2Pdf2Url = HasWindowsPath(outPath) ? filePath : outPath,  // Use the sap path when reporting back status to SAP if applicable
-                        //             //Wo2Pdf2Url = filePath,
-                        //             Msgty = messageType,
-                        //             Msgnr = jobInfo.Msg ?? string.Empty,
-                        //             Msgv1 = fileSizeBytes.ToString()  // Include the byte count
-                        //         }
-                        //    },
-                        //    IvWo2Pdf2Job = jobInfo.JobId ?? string.Empty,
-                        //    IvPrint = jobInfo.Printed ?? string.Empty
-                        //};
+                    using (var rfcFunction = connection.CallRfcFunction("/ZPM/WO2PDF2_RECEIVE"))
+                    {
+                        string messageType = (effectiveStatus == "037" || effectiveStatus == "007") ? "I" : "E";
+
                         var receiveStatus = new ReceiveStatusIt
                         {
                             ItReceiveStatus = new[]
                             {
-                            new Wo2Pdf2ReceiveStatusI
-                            {
-                                Aufnr = effectiveStatus == "037"
-                                    ? jobInfo.Wo?.PadLeft(20, '0') ?? string.Empty
-                                    : new string('0', 20),
-                                Vornr = jobInfo.Sequence?.Length > 4
-                                    ? jobInfo.Sequence.Substring(jobInfo.Sequence.Length - 4)
-                                    : jobInfo.Sequence?.PadLeft(4, '0') ?? string.Empty,
-                                Objtyp = "BUS2007",
-                               // Wo2Pdf2Url = HasWindowsPath(outPath) ? filePath : outPath,
-                                Wo2Pdf2Url = filePath,
-                                Msgty = (effectiveStatus == "037" || effectiveStatus == "007") ? "I" : "E",
-                                Msgnr = effectiveStatus,
-                                Msgv1 = fileSizeBytes.ToString() // Include the byte count
-                            }
-                        },
+                        new Wo2Pdf2ReceiveStatusI
+                        {
+                            Aufnr = effectiveStatus == "037"
+                                ? jobInfo.Wo?.PadLeft(20, '0') ?? string.Empty
+                                : new string('0', 20),
+                            Vornr = jobInfo.Sequence?.Length > 4
+                                ? jobInfo.Sequence.Substring(jobInfo.Sequence.Length - 4)
+                                : jobInfo.Sequence?.PadLeft(4, '0') ?? string.Empty,
+                            Objtyp = "BUS2007",
+                            Wo2Pdf2Url =  HasWindowsPath(outPath) ? filePath : outPath,
+                            Msgty = messageType,
+                            Msgnr = effectiveStatus,
+                            Msgv1 = fileSizeBytes.ToString()
+                        }
+                    },
                             IvWo2Pdf2Job = jobInfo.JobId ?? string.Empty,
                             IvPrint = jobInfo.Printed ?? string.Empty
                         };
 
-                        _logger.LogInformation($"ReceiveStatusIt object prepared: {receiveStatus}");
+                        rfcFunction.Mapper = _mapper;
+                        
+                        try
+                        {
+                            rfcFunction.Invoke(receiveStatus);
 
-                    // Set the mapper for the function call
-                    rfcFunction.Mapper = _mapper;
-
-                    try
-                    {
-                        // Send the job status to SAP
-                        rfcFunction.Invoke(receiveStatus);
-
-                        _logger.LogInformation("RFC callback executed successfully.");
-                        _logger.LogInformation($"Successfully reported status to SAP for job {jobInfo.JobId}.");
+                            _logger.LogInformation("RFC callback executed successfully.");
+                            _logger.LogInformation($"Successfully reported status to SAP for job {jobInfo.JobId}.");
+                        }
+                        catch (RfcException ex)
+                        {
+                            _logger.LogInformation($"Communication error: {ex.Message}");
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogInformation($"Unexpected error: {ex.Message}");
+                        }
                     }
-                    catch (RfcException ex) // Network-related errors
-                    {
-                        _logger.LogInformation($"Communication error: {ex.Message}");
-                    }
-                    catch (Exception ex) // Any other unexpected errors
-                    {
-                        _logger.LogInformation($"Unexpected error: {ex.Message}");
-                    }
-                   
                 }
             }
+            catch (RfcException ex)
+            {
+                _logger.LogError(ex, $"SAP RFC error for job {jobInfo.JobId}: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"General error during SAP RFC call for job {jobInfo.JobId}: {ex.Message}");
+            }
         }
-        catch (RfcException ex)
+
+        /// <summary>
+        /// Checks if a file exists and is not locked by another process, retrying with exponential backoff.
+        /// Ensures that the file is ready for processing before proceeding.
+        /// </summary>
+        /// <param name="filePath">The path to the file being checked.</param>
+        /// <param name="cancellationToken">Token for handling task cancellation requests.</param>
+        /// <returns>True if the file exists and is not locked; otherwise, false after retries are exhausted.</returns>
+        /// <exception cref="Exception">Logs errors encountered during the file readiness check.</exception>
+
+        private async Task<bool> WaitForFileExistsAsync(string path, CancellationToken cancellationToken)
         {
-            _logger.LogError(ex, $"SAP RFC error for job {jobInfo.JobId}: {ex.Message}");
+            const int maxRetries = 5;
+            const int delayMs = 300;
+
+            for (int i = 0; i < maxRetries; i++)
+            {
+                if (File.Exists(path))
+                    return true;
+
+                await Task.Delay(delayMs, cancellationToken);
+            }
+
+            return false;
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, $"General error during SAP RFC call for job {jobInfo.JobId}: {ex.Message}");
-        }
-    }
+
+
+        //public async Task UpdateStatusAsync(JobInfo jobInfo, CancellationToken cancellationToken)
+        //{
+        //    _logger.LogInformation($"Preparing to update SAP status for JobId={jobInfo.JobId}, Wo={jobInfo.Wo}");
+
+        //    try
+        //    {
+        //        // Retrieve RFC settings from the database
+        //        var rfcSettings = await _dataAccess.GetRFCSettingsAsync();
+        //        if (rfcSettings == null || rfcSettings.Count == 0)
+        //        {
+        //            _logger.LogError(null, "No RFC settings found in the database.");
+        //            return;
+        //        }
+
+        //        var settings = rfcSettings.FirstOrDefault();
+        //        if (settings == null)
+        //        {
+        //            _logger.LogError(null, "Could not retrieve valid RFC settings from the database.");
+        //            return;
+        //        }
+
+        //        // Retrieve the current environment setting
+        //        var environmentSetting = await _dataAccess.GetConfigurationSettingAsync("AppSettings", "Environment");
+        //        if (environmentSetting == null)
+        //        {
+        //            _logger.LogError(null, "Environment configuration not found.");
+        //            return;
+        //        }
+
+        //        // Retrieve SAP Folder Settings from the database
+        //        var sapFolderSettings = await _dataAccess.GetSapFolderSettingsAsync();
+        //        var sapFolder = sapFolderSettings.FirstOrDefault(s => s.Name == environmentSetting.Value);
+        //        if (sapFolder == null)
+        //        {
+        //            _logger.LogError(null, $"No SAP folder settings found for environment {environmentSetting.Value}.");
+        //            return;
+        //        }
+
+        //        // Ensure jobId is padded with leading zeros (assuming 10 digits)
+        //        string paddedJobId = jobInfo.JobId.PadLeft(10, '0');
+
+        //        // Construct file path based on the status type (037 for work order, 007 for job)
+        //        string sapPath = sapFolder.SapPath;
+        //        string environmentFolder = environmentSetting.Value;
+        //        string outPath = string.Empty;
+        //        string loutPath = string.Empty;
+        //        string filePath = string.Empty;
+
+        //        // Map status "009" to a valid SAP-compatible status
+        //        string effectiveStatus = jobInfo.Msg == "009"
+        //            ? (jobInfo.Wo.Length < 5 ? "007" : "037")
+        //            : jobInfo.Msg;
+
+        //        //if (jobInfo.Msg == "037")
+        //        //{
+        //        //    // Ensure Wo (work order) is padded with leading zeros (12 digits) for 037 status
+        //        //    string paddedWo = jobInfo.Wo.PadLeft(12, '0');
+        //        //    outPath = $"{sapPath}/{environmentFolder}/Out/{paddedJobId}/{paddedWo}.pdf";  // Work order file
+        //        //    loutPath = $"{environmentFolder}\\Out\\{paddedJobId}\\{paddedWo}.pdf";  // Work order file'
+
+        //        //}
+        //        //else if (jobInfo.Msg == "007")  // Job complete
+        //        //{
+        //        //    // For job complete status, pad Aufnr with 20 zeros
+        //        //    outPath = $"{sapPath}/{environmentFolder}/Out/{paddedJobId}/{paddedJobId}.pdf";  // Job file
+        //        //    loutPath = $"{environmentFolder}\\Out\\{paddedJobId}\\{paddedJobId}.pdf";  // Job file
+        //        //    filePath = System.IO.Path.Combine(sapFolder.Path, loutPath);
+        //        //}
+        //        //else if (jobInfo.Msg == "009")  // Printing disabled by configuration
+        //        //{
+        //        //    // for errors, use exactly the file the caller provided
+        //        //    filePath = jobInfo.File;
+        //        //}
+        //        //else
+        //        //{
+        //        //    _logger.LogWarning($"Unknown status code {jobInfo.Msg} for JobId={jobInfo.JobId}. No valid file path generated.");
+        //        //    return;
+        //        //}
+
+        //        if (effectiveStatus == "037")
+        //        {
+        //            string paddedWo = jobInfo.Wo.PadLeft(12, '0');
+        //            outPath = $"{sapPath}/{environmentFolder}/Out/{paddedJobId}/{paddedWo}.pdf";
+        //            loutPath = $"{environmentFolder}\\Out\\{paddedJobId}\\{paddedWo}.pdf";
+        //            filePath = System.IO.Path.Combine(sapFolder.Path, loutPath);
+        //        }
+        //        else if (effectiveStatus == "007")
+        //        {
+        //            outPath = $"{sapPath}/{environmentFolder}/Out/{paddedJobId}/{paddedJobId}.pdf";
+        //            loutPath = $"{environmentFolder}\\Out\\{paddedJobId}\\{paddedJobId}.pdf";
+        //            filePath = System.IO.Path.Combine(sapFolder.Path, loutPath);
+        //        }
+
+        //        //if (jobInfo.Msg == "009")  // Printing disabled by configuration
+        //        //{
+        //        //    // for errors, use exactly the file the caller provided
+        //        //    filePath = jobInfo.File;
+        //        //}
+        //        //else
+        //        //{
+        //        //    _logger.LogWarning($"Unknown status code {jobInfo.Msg} for JobId={jobInfo.JobId}. No valid file path generated.");
+        //        //    return;
+        //        //}
+
+
+        //        // Use the local path and files for processing
+
+        //        filePath = System.IO.Path.Combine(sapFolder.Path, loutPath);
+
+        //        if (jobInfo.Msg == "009")  // Printing disabled by configuration
+        //        {
+        //            // for errors, use exactly the file the caller provided
+        //            filePath = jobInfo.File;
+        //        }
+
+
+        //        // Ensure file is ready before proceeding
+        //        if (!await WaitForFileExistsAsync(filePath, cancellationToken))
+        //        {
+        //            _logger.LogError(null, $"File is not ready or locked after retries: {filePath}");
+        //            return;  // Exit if the file is not available
+        //        }
+
+        //        // Retrieve the file size in bytes
+        //        var fileInfo = new FileInfo(filePath);
+        //        File.SetAttributes(filePath, FileAttributes.Normal);
+        //        long fileSizeBytes = fileInfo.Length;
+        //        _logger.LogInformation($"File size (bytes): {fileSizeBytes} for {filePath}");
+
+
+        //        // Proceed with SAP RFC call after file is ready
+        //        using (var connection = new RfcConnection(new RfcConnectionParameterBuilder()
+        //                .UseConnectionHost(settings.MSHOST)
+        //                .UseLogonUserName(settings.User)
+        //                .UseLogonPassword(settings.Password)
+        //                .UseLogonClient(settings.CLIENT.ToString())
+        //                .UseLogonLanguage(settings.LogonLang)
+        //                .UseSystemNumber(settings.SYSNR.ToString())))
+        //        {
+
+        //            //_logger.LogInformation("Attempting to establish a connection to SAP RFC.");
+
+        //            connection.Open();
+        //            _logger.LogInformation("Successfully connected to SAP.");
+
+        //            using (var rfcFunction = connection.CallRfcFunction("/ZPM/WO2PDF2_RECEIVE"))
+        //            {
+        //                // Determine message type based on the job status
+        //                string messageType = jobInfo.Msg switch
+        //                {
+        //                    "037" => "I",  // Work order 
+        //                    "007" => "I",  // Job 
+        //                    "005" => "E",  // File to be printed doesn’t exist
+        //                    "009" => "E",  // Printing disabled by configuration
+        //                    _ => "E",      // Default to error
+        //                };
+
+        //                //Prepare the ReceiveStatusIt object
+        //                //var receiveStatus = new ReceiveStatusIt
+        //                //{
+        //                //    ItReceiveStatus = new[]
+        //                //    {
+        //                //         new Wo2Pdf2ReceiveStatusI
+        //                //         {
+        //                //             //Aufnr = jobInfo.Msg == "037" || jobInfo.Msg == "009"
+        //                //             Aufnr = jobInfo.Msg == "037"
+        //                //                 ? jobInfo.Wo?.PadLeft(20, '0') ?? string.Empty  // For status 037, pad Wo to 20 digits
+        //                //                 : new string('0', 20),                          // For status 007, send 20 zeros
+        //                //             Vornr = jobInfo.Sequence?.Length > 4
+        //                //                 ? jobInfo.Sequence.Substring(jobInfo.Sequence.Length - 4)  // Truncate to the last 4 characters
+        //                //                 : jobInfo.Sequence?.PadLeft(4, '0') ?? string.Empty,  // Pad with leading zeros if less than 4 characters
+        //                //             Objtyp = "BUS2007",
+        //                //             Wo2Pdf2Url = HasWindowsPath(outPath) ? filePath : outPath,  // Use the sap path when reporting back status to SAP if applicable
+        //                //             //Wo2Pdf2Url = filePath,
+        //                //             Msgty = messageType,
+        //                //             Msgnr = jobInfo.Msg ?? string.Empty,
+        //                //             Msgv1 = fileSizeBytes.ToString()  // Include the byte count
+        //                //         }
+        //                //    },
+        //                //    IvWo2Pdf2Job = jobInfo.JobId ?? string.Empty,
+        //                //    IvPrint = jobInfo.Printed ?? string.Empty
+        //                //};
+        //                var receiveStatus = new ReceiveStatusIt
+        //                {
+        //                    ItReceiveStatus = new[]
+        //                    {
+        //                        new Wo2Pdf2ReceiveStatusI
+        //                        {
+        //                            Aufnr = effectiveStatus == "037"
+        //                                ? jobInfo.Wo?.PadLeft(20, '0') ?? string.Empty
+        //                                : new string('0', 20),
+        //                            Vornr = jobInfo.Sequence?.Length > 4
+        //                                ? jobInfo.Sequence.Substring(jobInfo.Sequence.Length - 4)
+        //                                : jobInfo.Sequence?.PadLeft(4, '0') ?? string.Empty,
+        //                            Objtyp = "BUS2007",
+        //                           // Wo2Pdf2Url = HasWindowsPath(outPath) ? filePath : outPath,
+        //                            Wo2Pdf2Url = filePath,
+        //                            Msgty = (effectiveStatus == "037" || effectiveStatus == "007") ? "I" : "E",
+        //                            Msgnr = effectiveStatus,
+        //                            Msgv1 = fileSizeBytes.ToString() // Include the byte count
+        //                        }
+        //                    },
+        //                    IvWo2Pdf2Job = jobInfo.JobId ?? string.Empty,
+        //                    IvPrint = jobInfo.Printed ?? string.Empty
+        //                };
+
+        //                _logger.LogInformation($"ReceiveStatusIt object prepared: {receiveStatus}");
+
+        //                // Set the mapper for the function call
+        //                rfcFunction.Mapper = _mapper;
+
+        //                try
+        //                {
+        //                    // Send the job status to SAP
+        //                    rfcFunction.Invoke(receiveStatus);
+
+        //                    _logger.LogInformation("RFC callback executed successfully.");
+        //                    _logger.LogInformation($"Successfully reported status to SAP for job {jobInfo.JobId}.");
+        //                }
+        //                catch (RfcException ex) // Network-related errors
+        //                {
+        //                    _logger.LogInformation($"Communication error: {ex.Message}");
+        //                }
+        //                catch (Exception ex) // Any other unexpected errors
+        //                {
+        //                    _logger.LogInformation($"Unexpected error: {ex.Message}");
+        //                }
+
+        //            }
+        //        }
+        //    }
+        //    catch (RfcException ex)
+        //    {
+        //        _logger.LogError(ex, $"SAP RFC error for job {jobInfo.JobId}: {ex.Message}");
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        _logger.LogError(ex, $"General error during SAP RFC call for job {jobInfo.JobId}: {ex.Message}");
+        //    }
+        //}
 
 
         /// <summary>
@@ -389,72 +569,7 @@ namespace PrintPlusService.Services
         }
 
 
-        /// <summary>
-        /// Checks if a file exists and is not locked by another process, retrying with exponential backoff.
-        /// Ensures that the file is ready for processing before proceeding.
-        /// </summary>
-        /// <param name="filePath">The path to the file being checked.</param>
-        /// <param name="cancellationToken">Token for handling task cancellation requests.</param>
-        /// <returns>True if the file exists and is not locked; otherwise, false after retries are exhausted.</returns>
-        /// <exception cref="Exception">Logs errors encountered during the file readiness check.</exception>
-
-        private async Task<bool> WaitForFileExistsAsync(string filePath, CancellationToken cancellationToken)
-        {
-            int retryCount = 0;
-            const int maxRetries = 3;  // Maximum number of retries
-            var delayMilliseconds = 2000;  // Initial delay between retries
-            const int maxDelayMilliseconds = 16000;  // Maximum delay for exponential backoff
-
-            //string temporaryWorkOrderFile = Path.GetFileNameWithoutExtension(filePath) + "_tmp.pdf";
-
-            while (retryCount < maxRetries)
-            {
-                try
-                {
-                    if (File.Exists(filePath) && !IsFileLocked(filePath))
-                    {
-                        _logger.LogInformation($"File is available: {filePath}");
-                        //Thread.Sleep(10000); // Delay to ensure that the file is ready before RFC call
-                        return true;  // File exists and is not locked
-                    }        
-
-                    retryCount++;
-
-                    if (IsFileLocked(filePath))
-                    {
-                        _logger.LogInformation($"File is locked (Attempt {retryCount}/{maxRetries}), waiting to retry: {filePath}");
-                    }
-                    else
-                    {
-                        _logger.LogInformation($"Waiting for file to be created (Attempt {retryCount}/{maxRetries}): {filePath}");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, $"Error while checking file status (Attempt {retryCount}/{maxRetries}): {filePath}");
-                }
-
-                await Task.Delay(delayMilliseconds, cancellationToken);
-
-                // Exponential backoff with a maximum cap on the delay
-                delayMilliseconds = Math.Min(delayMilliseconds * 2, maxDelayMilliseconds);
-            }
-
-            // After retries are exhausted, log a final error and return false
-            var errorMessage = $"File was not created or is still locked after {maxRetries} attempts: {filePath}";
-            _logger.LogError(null, errorMessage);
-
-            return false;  // File doesn't exist or is still locked
-        }
-
-        /// <summary>
-        /// Helper method to determine if a file is locked by another process.
-        /// Attempts to open the file with exclusive access to check its availability.
-        /// </summary>
-        /// <param name="filePath">The path to the file being checked.</param>
-        /// <returns>True if the file is locked; otherwise, false.</returns>
-        /// <exception cref="IOException">Handles cases where the file is locked due to being opened by another process.</exception>
-
+ 
 
         // Helper method to check if the file is locked by another process
         private bool IsFileLocked(string filePath)

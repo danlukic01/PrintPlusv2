@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 
 namespace PrintPlusService.Services
@@ -16,5 +17,8 @@ namespace PrintPlusService.Services
         Task<string> ConvertToPdf(string filePath, string cachePath);
 
         Task<bool> TryRepairPdfWithLibreOffice(string inputPath, string outputPath, string cachePath);
+
+        Task ConvertFilesInParallelAsync(List<string> filePaths, string cachePath);
     }
 }
+

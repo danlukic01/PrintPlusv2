@@ -15,13 +15,9 @@ using CommonInterfaces.Models;
 using System.Globalization;
 using PdfSharpCore.Drawing.Layout;
 using System.Xml;
-using DocumentFormat.OpenXml.Wordprocessing;
 using System.Diagnostics;
 using PdfSharpCore.Exceptions;
 using System.Collections.Concurrent;
-using Aspose.Pdf.Operators;
-using DocumentFormat.OpenXml.Drawing.Charts;
-using static Dropbox.Api.TeamLog.SpaceCapsType;
 using System.Text.RegularExpressions;
 
 //using Dropbox.Api;
@@ -57,7 +53,13 @@ namespace PrintPlusService.Services
         private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
 
         private const double PageNumberFontSize = 8;
-       
+
+        public class WorkOrderUrl
+        {
+            public string WorkOrderId { get; set; }
+            public string Url { get; set; }
+        }
+
         class FileLockEntry
         {
             public SemaphoreSlim Semaphore { get; } = new(1, 1);
@@ -441,14 +443,26 @@ namespace PrintPlusService.Services
 
                         // Download SharePoint documents
                         List<string> urlsToDownload = null;
-                        List<string> downloadedFiles = null;
+                       // List<string> downloadedFiles = null;
+                        List<WorkOrderUrl> extractedUrls = null;
                         var urlToFilePathMapping = new Dictionary<string, string>();
 
                         try
                         {
                             // Extract URLs and download files from SharePoint
-                            urlsToDownload = await ExtractUrlsFromWorkOrderFiles(workOrderFilePaths, cancellationToken);
-                            downloadedFiles = await DownloadAllFilesAsync(urlsToDownload, cacheFolderPath, jobId, cancellationToken);
+                            //urlsToDownload = await ExtractUrlsFromWorkOrderFiles(workOrderFilePaths, cancellationToken);
+                            extractedUrls = await ExtractUrlsFromWorkOrderFiles(workOrderFilePaths, cancellationToken);
+                         //   downloadedFiles = await DownloadAllFilesAsync(extractedUrls, cacheFolderPath, jobId, cancellationToken);
+
+
+                            // Download files while preserving WorkOrderId
+                            List<(string WorkOrderId, string FilePath)> downloadedFilesWithIds =
+                                await DownloadAllFilesAsync(extractedUrls, cacheFolderPath, jobId, cancellationToken);
+
+                            // Optional: If you just need file paths without work order association
+                            List<string> downloadedFiles = downloadedFilesWithIds
+                                .Select(x => x.FilePath)
+                                .ToList();
 
                             if (downloadedFiles.Any())
                                 hasSharepointAttachment = true;
@@ -465,10 +479,16 @@ namespace PrintPlusService.Services
 
                             _logger.LogInformation($"Downloaded {downloadedFiles.Count} files from SharePoint.");
 
+                            //// Populate the dictionary with the full URL as the key
+                            //for (int i = 0; i < urlsToDownload?.Count; i++)
+                            //{
+                            //    urlToFilePathMapping[urlsToDownload[i]] = downloadedFiles[i];
+                            //}
+
                             // Populate the dictionary with the full URL as the key
-                            for (int i = 0; i < urlsToDownload?.Count; i++)
+                            for (int i = 0; i < extractedUrls?.Count; i++)
                             {
-                                urlToFilePathMapping[urlsToDownload[i]] = downloadedFiles[i];
+                                urlToFilePathMapping[extractedUrls[i].Url] = downloadedFiles[i];
                             }
                         }
                         catch (Exception ex)
@@ -597,17 +617,20 @@ namespace PrintPlusService.Services
 
                         // Update workOrderFilePaths to exclude URLs, HTTP/HTTPS links, and SAP DMS files since they are already downloaded and mapped
                         workOrderFilePaths = workOrderFilePaths
-                            .Where(fp => !fp.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) &&
-                                         !Uri.IsWellFormedUriString(fp, UriKind.Absolute) &&    // Skip well-formed URIs (including HTTP/HTTPS)
-                                         !fp.StartsWith("http://", StringComparison.OrdinalIgnoreCase) && // Skip HTTP links
-                                         !fp.StartsWith("https://", StringComparison.OrdinalIgnoreCase) && // Skip HTTPS links
-                                         !IsSapDmsFile(fp))  // Custom method to exclude SAP DMS files
-                            .Select(fp => urlToFilePathMapping.ContainsKey(fp) ? urlToFilePathMapping[fp] : fp)
+                            .Where(fp =>
+                                !fp.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) &&
+                                !Uri.IsWellFormedUriString(fp, UriKind.Absolute) &&  // Skip full URLs like SharePoint
+                                !IsSapDmsFile(fp))                                    // Skip SAP DMS files
+                            .Select(fp =>
+                                urlToFilePathMapping.TryGetValue(fp, out var mapped) ? mapped : fp) // Replace with downloaded path
                             .ToList();
 
                         // Copy and convert files
                         try
                         {
+
+                            //await Task.Delay(3000);
+                         
                             (fileMappings, errorFilePaths) = await CopyAndConvertFiles(inFolderPath, cacheFolderPath, workOrderFilePaths, uniqueJobId, cancellationToken);
 
                             //// Log success to the database
@@ -654,7 +677,7 @@ namespace PrintPlusService.Services
 
                         try
                         {
-                            await ConcatenateAndPrintFiles(jobId, uniqueJobId, outFolderPath, cacheFolderPath, filePath, outFolderPath, urlToFilePathMapping, cancellationToken);
+                            await ConcatenateAndPrintFiles(jobId, uniqueJobId, outFolderPath, cacheFolderPath, filePath, outFolderPath, urlToFilePathMapping, extractedUrls, cancellationToken);
 
                             // Log success to the database
                             await _dataAccess.AddLogEntryAsync(new LogEntry
@@ -880,6 +903,7 @@ namespace PrintPlusService.Services
                         //}
 
                         _logger.LogInformation($"Moved XML file to: {xmlFolderPath}");
+
                         File.Move(filePath, Path.Combine(xmlFolderPath, Path.GetFileName(filePath)), true);
 
                     }
@@ -968,6 +992,7 @@ namespace PrintPlusService.Services
 
                     // Fetch the existing work orders using uniqueJobId
                     var existingWorkOrders = await dataAccess.GetWorkOrdersByUniqueJobIdAsync(uniqueJobId);
+
                     if (existingWorkOrders == null || !existingWorkOrders.Any())
                     {
                         _logger.LogWarning($"WorkOrders with UniqueJobId {uniqueJobId} not found. Creating a new entry.");
@@ -1031,134 +1056,107 @@ namespace PrintPlusService.Services
             }
         }
 
+        public class WorkOrderUrlComparer : IEqualityComparer<(string WorkOrderId, string Url)>
+        {
+            public bool Equals((string WorkOrderId, string Url) x, (string WorkOrderId, string Url) y)
+            {
+                return string.Equals(x.WorkOrderId, y.WorkOrderId, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(x.Url, y.Url, StringComparison.OrdinalIgnoreCase);
+            }
+
+            public int GetHashCode((string WorkOrderId, string Url) obj)
+            {
+                unchecked
+                {
+                    int hash = 17;
+                    hash = hash * 23 + (obj.WorkOrderId?.ToLowerInvariant().GetHashCode() ?? 0);
+                    hash = hash * 23 + (obj.Url?.ToLowerInvariant().GetHashCode() ?? 0);
+                    return hash;
+                }
+            }
+        }
 
         /// <summary>
         /// Extracts URLs from the provided work order files.
         /// </summary>
         /// <param name="workOrderFilePaths">A list of file paths for the work order files.</param>
         /// <returns>A list of extracted URLs.</returns>
-        private async Task<List<string>> ExtractUrlsFromWorkOrderFiles(List<string> workOrderFilePaths, CancellationToken cancellationToken)
+        private async Task<List<WorkOrderUrl>> ExtractUrlsFromWorkOrderFiles(List<string> filePaths, CancellationToken cancellationToken)
         {
-            var urls = new List<string>();
+            var result = new List<WorkOrderUrl>();
+            var seenPairs = new HashSet<(string WorkOrderId, string Url)>(new WorkOrderUrlComparer());
             var errorMessages = new List<string>();
 
-            foreach (var filePath in workOrderFilePaths)
+            foreach (var filePath in filePaths)
             {
+                if (cancellationToken.IsCancellationRequested)
+                    break;
+
                 try
                 {
-                    if (Path.GetExtension(filePath).Equals(".xml", StringComparison.OrdinalIgnoreCase))
+                    if (!Path.GetExtension(filePath).Equals(".xml", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    using var reader = File.OpenRead(filePath);
+                    var document = XDocument.Load(reader);
+                    var workOrderId = ExtractWorkOrderIdFromFilePath(filePath);
+
+                    var urlElements = document.Descendants("WorkOrderPart")
+                        .Where(e =>
+                            string.Equals(e.Element("Type")?.Value, "URL", StringComparison.OrdinalIgnoreCase) &&
+                            !string.Equals(e.Element("Type")?.Value, "SAPDMS", StringComparison.OrdinalIgnoreCase))
+                        .Select(e => e.Element("FilePath"))
+                        .Where(e => e != null)
+                        .ToList();
+
+                    foreach (var element in urlElements)
                     {
-                        var document = XDocument.Load(filePath);
+                        var cdata = element.Nodes().OfType<XCData>().FirstOrDefault();
+                        var url = cdata?.Value ?? element.Value;
 
-                        var urlElements = document.Descendants("WorkOrderPart")
-                            .Where(e => e.Element("Type") != null &&
-                                        !e.Element("Type").Value.Equals("SAPDMS", StringComparison.OrdinalIgnoreCase) &&
-                                        e.Element("Type").Value.Equals("URL", StringComparison.OrdinalIgnoreCase))
-                            .Select(e => e.Element("FilePath"))
-                            .Where(e => e != null) // avoid nulls
-                            .ToList(); // ✅ create a safe copy for iteration
-
-                        foreach (var element in urlElements)
+                        var pair = (workOrderId, url);
+                        if (seenPairs.Add(pair)) // skip duplicates
                         {
-                            var cdata = element.Nodes().OfType<XCData>().FirstOrDefault();
-
-                            if (cdata != null)
+                            result.Add(new WorkOrderUrl
                             {
-                                urls.Add(cdata.Value);
-                            }
-                            else
-                            {
-                                urls.Add(element.Value);
-                            }
-                        }
-
-                        // Logging
-                        using (var scope = _serviceScopeFactory.CreateScope())
-                        {
-                            var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
-                            await dataAccess.AddLogEntryAsync(new LogEntry
-                            {
-                                Timestamp = DateTime.UtcNow,
-                                Level = "Information",
-                                Message = $"Successfully extracted URLs from file: {filePath}",
-                                JobId = ExtractWorkOrderIdFromFilePath(filePath)
+                                WorkOrderId = workOrderId,
+                                Url = url
                             });
                         }
                     }
+
+                    await LogToDbAsync("Information", $"Successfully extracted URLs from file: {filePath}", workOrderId);
                 }
                 catch (Exception ex)
                 {
                     var errorMessage = "Failed to retrieve file URL from XML. Please ensure the URL is correct.";
                     _logger.LogError(ex, $"Failed to retrieve SharePoint URL link from XML: {filePath}");
-
-                    // Add client-friendly message to error list
                     errorMessages.Add(errorMessage);
 
                     var errorFilePath = Path.Combine(Path.GetDirectoryName(filePath), $"Error_ExtractURL_{Path.GetFileNameWithoutExtension(filePath)}.pdf");
                     SaveErrorPdf(errorFilePath, new List<string> { errorMessage });
 
-                    // Log the error to the database and save error details
                     var workOrderId = ExtractWorkOrderIdFromFilePath(filePath);
-                    using (var scope = _serviceScopeFactory.CreateScope())
-                    {
-                        var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
-                        await dataAccess.AddLogEntryAsync(new LogEntry
-                        {
-                            Timestamp = DateTime.UtcNow,
-                            Level = "Error",
-                            Message = $"Error extracting URL from file: {filePath}. {errorMessage}",
-                            JobId = workOrderId
-                        });
-                        await SaveErrorDetails(workOrderId, new List<string> { errorMessage }, cancellationToken);
-                    }
+                    await LogToDbAsync("Error", $"Error extracting URL from file: {filePath}. {errorMessage}", workOrderId);
+                    await SaveErrorDetails(workOrderId, new List<string> { errorMessage }, cancellationToken);
                 }
             }
 
-            if (errorMessages.Any())
-            {
-                try
-                {
-                    var errorFilePath = Path.Combine(Path.GetDirectoryName(workOrderFilePaths.First()), "Error_ExtractUrls.pdf");
-                    SaveErrorPdf(errorFilePath, errorMessages);
-
-                    using (var scope = _serviceScopeFactory.CreateScope())
-                    {
-                        var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
-                        var workOrderId = ExtractWorkOrderIdFromFilePath(workOrderFilePaths.First());
-                        await dataAccess.AddLogEntryAsync(new LogEntry
-                        {
-                            Timestamp = DateTime.UtcNow,
-                            Level = "Error",
-                            Message = "Multiple errors occurred while extracting URLs from work order files.",
-                            JobId = workOrderId
-                        });
-                        await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    var finalErrorMessage = "An error occurred while saving error details. Please contact support.";
-                    _logger.LogError(ex, finalErrorMessage);
-
-                    // Log critical error if error details cannot be saved
-                    using (var scope = _serviceScopeFactory.CreateScope())
-                    {
-                        var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
-                        var workOrderId = ExtractWorkOrderIdFromFilePath(workOrderFilePaths.First());
-                        await dataAccess.AddLogEntryAsync(new LogEntry
-                        {
-                            Timestamp = DateTime.UtcNow,
-                            Level = "Critical",
-                            Message = $"Critical error occurred while saving error details: {ex.Message}",
-                            JobId = workOrderId
-                        });
-                    }
-                }
-            }
-
-            return urls;
+            return result;
         }
 
+        private async Task LogToDbAsync(string level, string message, string jobId)
+        {
+            using var scope = _serviceScopeFactory.CreateScope();
+            var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+            await dataAccess.AddLogEntryAsync(new LogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Level = level,
+                Message = message,
+                JobId = jobId
+            });
+        }
 
         /// <summary>
         /// Downloads all files from the provided SharePoint URLs to the specified destination path.
@@ -1168,21 +1166,31 @@ namespace PrintPlusService.Services
         /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
         /// <returns>A list of file paths for the successfully downloaded files.</returns>
         // Thread safe implementation
-        private async Task<List<string>> DownloadAllFilesAsync(IEnumerable<string> fileUrls, string destinationPath, string uniqueJobId, CancellationToken cancellationToken)
+        private async Task<List<(string WorkOrderId, string FilePath)>> DownloadAllFilesAsync(
+        List<WorkOrderUrl> workOrderUrls,
+        string destinationPath,
+        string jobId,
+        CancellationToken cancellationToken)
         {
-            var fileUrlList = fileUrls.ToList();
-            var downloadedFiles = new string[fileUrlList.Count];
+            var downloadedFiles = new List<(string WorkOrderId, string FilePath)>();
             var errorMessages = new ConcurrentBag<string>();
-            var maxDegreeOfParallelism = 5; // Tune based on environment and SharePoint limits
+            var maxDegreeOfParallelism = 5;
             using var semaphore = new SemaphoreSlim(maxDegreeOfParallelism);
 
-            var downloadTasks = fileUrlList.Select((url, index) => Task.Run(async () =>
+            var downloadTasks = workOrderUrls.Select(async item =>
             {
                 await semaphore.WaitAsync(cancellationToken);
+                var stopwatch = Stopwatch.StartNew();
+
                 try
                 {
-                    var downloadedFilePath = await _sharePointService.DownloadFileAsync(url, destinationPath);
-                    downloadedFiles[index] = downloadedFilePath;
+                    var downloadedFilePath = await _sharePointService.DownloadFileAsync(item.Url, destinationPath);
+                    stopwatch.Stop();
+
+                    string elapsedFormatted = stopwatch.Elapsed.ToString(@"mm\:ss");
+                    string fileName = Path.GetFileName(downloadedFilePath);
+
+                    _logger.LogInformation($"SharePoint file download time for '{fileName}': {elapsedFormatted}");
 
                     using var scope = _serviceScopeFactory.CreateScope();
                     var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
@@ -1190,13 +1198,21 @@ namespace PrintPlusService.Services
                     {
                         Timestamp = DateTime.UtcNow,
                         Level = "Information",
-                        Message = $"Successfully downloaded file from URL: {url}",
-                        JobId = uniqueJobId
+                        Message = $"Successfully downloaded file from URL: {item.Url} in {elapsedFormatted}",
+                        JobId = item.WorkOrderId
                     });
+
+                    lock (downloadedFiles)
+                    {
+                        downloadedFiles.Add((item.WorkOrderId, downloadedFilePath));
+                    }
                 }
                 catch (Exception ex)
                 {
-                    var errorMessage = $"Failed to retrieve SharePoint URL link: {url} - {ex.Message}";
+                    stopwatch.Stop();
+                    string elapsedFormatted = stopwatch.Elapsed.ToString(@"mm\:ss");
+
+                    var errorMessage = $"Failed to retrieve SharePoint URL link: {item.Url} - {ex.Message} (after {elapsedFormatted})";
                     _logger.LogError(ex, errorMessage);
                     errorMessages.Add(errorMessage);
 
@@ -1210,19 +1226,19 @@ namespace PrintPlusService.Services
                             Timestamp = DateTime.UtcNow,
                             Level = "Error",
                             Message = errorMessage,
-                            JobId = uniqueJobId
+                            JobId = item.WorkOrderId
                         });
                     }
                     catch (Exception saveEx)
                     {
-                        _logger.LogError(saveEx, $"An error occurred while saving the work order error for URL: {url}");
+                        _logger.LogError(saveEx, $"An error occurred while saving the work order error for URL: {item.Url}");
                     }
                 }
                 finally
                 {
                     semaphore.Release();
                 }
-            }));
+            });
 
             await Task.WhenAll(downloadTasks);
 
@@ -1240,7 +1256,7 @@ namespace PrintPlusService.Services
 
                 try
                 {
-                    await SaveErrorDetails(uniqueJobId, errorMessages.ToList(), cancellationToken);
+                    await SaveErrorDetails(jobId, errorMessages.ToList(), cancellationToken);
                 }
                 catch (Exception saveEx)
                 {
@@ -1252,13 +1268,251 @@ namespace PrintPlusService.Services
                         Timestamp = DateTime.UtcNow,
                         Level = "Critical",
                         Message = "Critical error occurred while saving error details to the database.",
-                        JobId = uniqueJobId
+                        JobId = jobId
                     });
                 }
             }
 
-            return downloadedFiles.Where(f => f != null).ToList(); // Remove failed/null entries
+
+            var orderedDownloadedFiles = workOrderUrls
+             .Select(url =>
+             {
+                 var cleanedUrl = CleanURL(url.Url);
+                 var fileName = Path.GetFileName(cleanedUrl);
+
+                 return downloadedFiles.FirstOrDefault(df =>
+                     df.WorkOrderId == url.WorkOrderId &&
+                     Path.GetFileName(df.FilePath).Equals(fileName, StringComparison.OrdinalIgnoreCase));
+             })
+             .Where(df => !string.IsNullOrEmpty(df.FilePath)) // filter out null or empty matches
+             .ToList();
+
+            return orderedDownloadedFiles;
         }
+
+
+        //    private async Task<List<string>> DownloadAllFilesAsync(
+        //IEnumerable<string> fileUrls,
+        //string destinationPath,
+        //string uniqueJobId,
+        //CancellationToken cancellationToken)
+        //    {
+        //        var fileUrlList = fileUrls.ToList();
+        //        var downloadedFiles = new ConcurrentBag<string>();
+        //        var errorMessages = new ConcurrentBag<string>();
+        //        var maxDegreeOfParallelism = 5;
+
+        //        using var semaphore = new SemaphoreSlim(maxDegreeOfParallelism);
+
+        //        var tasks = fileUrlList.Select(async url =>
+        //        {
+        //            if (cancellationToken.IsCancellationRequested)
+        //                return;
+
+        //            await semaphore.WaitAsync(cancellationToken);
+        //            var stopwatch = Stopwatch.StartNew();
+
+        //            try
+        //            {
+        //                var downloadedFilePath = await _sharePointService.DownloadFileAsync(url, destinationPath);
+        //                downloadedFiles.Add(downloadedFilePath);
+        //                stopwatch.Stop();
+
+        //                var elapsedFormatted = stopwatch.Elapsed.ToString(@"mm\:ss");
+        //                var fileName = Path.GetFileName(downloadedFilePath);
+        //                _logger.LogInformation($"SharePoint file download time for '{fileName}': {elapsedFormatted}");
+
+        //        using var scope = _serviceScopeFactory.CreateScope();
+        //                var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //                await dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Information",
+        //                    Message = $"Successfully downloaded file from URL: {url} in {elapsedFormatted}",
+        //                    JobId = uniqueJobId
+        //                });
+        //            }
+        //            catch (Exception ex)
+        //            {
+        //                stopwatch.Stop();
+        //                var elapsedFormatted = stopwatch.Elapsed.ToString(@"mm\:ss");
+        //                var errorMessage = $"Failed to retrieve SharePoint URL link: {url} - {ex.Message} (after {elapsedFormatted})";
+
+        //                _logger.LogError(ex, errorMessage);
+        //                errorMessages.Add(errorMessage);
+
+        //                if (!cancellationToken.IsCancellationRequested)
+        //                {
+        //                    try
+        //                    {
+        //                        await SaveWorkOrderErrorAsync("SharePointURL", errorMessage);
+
+        //                        using var scope = _serviceScopeFactory.CreateScope();
+        //                        var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //                        await dataAccess.AddLogEntryAsync(new LogEntry
+        //                        {
+        //                            Timestamp = DateTime.UtcNow,
+        //                            Level = "Error",
+        //                            Message = errorMessage,
+        //                            JobId = uniqueJobId
+        //                        });
+        //                    }
+        //                    catch (Exception saveEx)
+        //                    {
+        //                        _logger.LogError(saveEx, $"An error occurred while saving error details for URL: {url}");
+        //                    }
+        //                }
+        //            }
+        //            finally
+        //            {
+        //                semaphore.Release();
+        //            }
+        //        });
+
+        //        await Task.WhenAll(tasks);
+
+        //        if (!errorMessages.IsEmpty)
+        //        {
+        //            var errorList = errorMessages.ToList();
+
+        //            try
+        //            {
+        //                var errorFilePath = Path.Combine(destinationPath, "Error_Downloads.pdf");
+        //                SaveErrorPdf(errorFilePath, errorList);
+        //            }
+        //            catch (Exception pdfEx)
+        //            {
+        //                _logger.LogError(pdfEx, "An error occurred while saving the error PDF file.");
+        //            }
+
+        //            try
+        //            {
+        //                await SaveErrorDetails(uniqueJobId, errorList, cancellationToken);
+
+        //                using var scope = _serviceScopeFactory.CreateScope();
+        //                var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //                await dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Critical",
+        //                    Message = "Error(s) occurred during SharePoint downloads. See PDF for details.",
+        //                    JobId = uniqueJobId
+        //                });
+        //            }
+        //            catch (Exception saveEx)
+        //            {
+        //                _logger.LogError(saveEx, "An error occurred while saving the error details in the database.");
+        //            }
+        //        }
+
+        //        return downloadedFiles.ToList(); // Only successful downloads
+        //    }
+
+
+        //private async Task<List<string>> DownloadAllFilesAsync(IEnumerable<string> fileUrls, string destinationPath, string uniqueJobId, CancellationToken cancellationToken)
+        //{
+        //    var fileUrlList = fileUrls.ToList();
+        //    var downloadedFiles = new string[fileUrlList.Count];
+        //    var errorMessages = new ConcurrentBag<string>();
+        //    var maxDegreeOfParallelism = 5; // Tune based on environment and SharePoint limits
+        //    using var semaphore = new SemaphoreSlim(maxDegreeOfParallelism);
+
+        //    var downloadTasks = fileUrlList.Select((url, index) => Task.Run(async () =>
+        //    {
+        //        await semaphore.WaitAsync(cancellationToken);
+        //        var stopwatch = Stopwatch.StartNew();
+
+        //        try
+        //        {
+        //            var downloadedFilePath = await _sharePointService.DownloadFileAsync(url, destinationPath);
+        //            stopwatch.Stop();
+        //            downloadedFiles[index] = downloadedFilePath;
+
+        //            string elapsedFormatted = stopwatch.Elapsed.ToString(@"mm\:ss");
+        //            string fileName = Path.GetFileName(downloadedFilePath);
+
+        //            _logger.LogInformation(
+        //                $"SharePoint file download time for '{fileName}': {elapsedFormatted}");
+
+        //            using var scope = _serviceScopeFactory.CreateScope();
+        //            var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //            await dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Information",
+        //                Message = $"Successfully downloaded file from URL: {url} in {elapsedFormatted}",
+        //                JobId = uniqueJobId
+        //            });
+        //        }
+        //        catch (Exception ex)
+        //        {
+        //            stopwatch.Stop();
+        //            string elapsedFormatted = stopwatch.Elapsed.ToString(@"mm\:ss");
+
+        //            var errorMessage = $"Failed to retrieve SharePoint URL link: {url} - {ex.Message} (after {elapsedFormatted})";
+        //            _logger.LogError(ex, errorMessage);
+        //            errorMessages.Add(errorMessage);
+
+        //            try
+        //            {
+        //                await SaveWorkOrderErrorAsync("SharePointURL", errorMessage);
+        //                using var scope = _serviceScopeFactory.CreateScope();
+        //                var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //                await dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Error",
+        //                    Message = errorMessage,
+        //                    JobId = uniqueJobId
+        //                });
+        //            }
+        //            catch (Exception saveEx)
+        //            {
+        //                _logger.LogError(saveEx, $"An error occurred while saving the work order error for URL: {url}");
+        //            }
+        //        }
+        //        finally
+        //        {
+        //            semaphore.Release();
+        //        }
+        //    }));
+
+        //    await Task.WhenAll(downloadTasks);
+
+        //    if (errorMessages.Any())
+        //    {
+        //        try
+        //        {
+        //            var errorFilePath = Path.Combine(destinationPath, "Error_Downloads.pdf");
+        //            SaveErrorPdf(errorFilePath, errorMessages.ToList());
+        //        }
+        //        catch (Exception pdfEx)
+        //        {
+        //            _logger.LogError(pdfEx, "An error occurred while saving the error PDF file.");
+        //        }
+
+        //        try
+        //        {
+        //            await SaveErrorDetails(uniqueJobId, errorMessages.ToList(), cancellationToken);
+        //        }
+        //        catch (Exception saveEx)
+        //        {
+        //            _logger.LogError(saveEx, "An error occurred while saving the error details in the database.");
+        //            using var scope = _serviceScopeFactory.CreateScope();
+        //            var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //            await dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Critical",
+        //                Message = "Critical error occurred while saving error details to the database.",
+        //                JobId = uniqueJobId
+        //            });
+        //        }
+        //    }
+
+        //    return downloadedFiles.Where(f => f != null).ToList(); // Remove failed/null entries
+        //}
+
 
         static bool HasWindowsPath(string path)
         {
@@ -1279,192 +1533,200 @@ namespace PrintPlusService.Services
 
         // Thread safe implementation
         private async Task<(Dictionary<string, string> fileMappings, List<string> errorFilePaths)> CopyAndConvertFiles(
-        string sourceFolder, string targetFolder, List<string> workOrderFilePaths, string uniqueJobId, CancellationToken cancellationToken)
+        string sourceFolder,
+        string targetFolder,
+        List<string> workOrderFilePaths,
+        string uniqueJobId,
+        CancellationToken cancellationToken)
         {
             var fileMappings = new ConcurrentDictionary<string, string>();
             var errorFilePaths = new ConcurrentBag<string>();
             var errorMessages = new ConcurrentDictionary<string, ConcurrentBag<string>>();
 
-            var tasks = workOrderFilePaths.Select(async originalFilePath =>
-            {
-                await _semaphore.WaitAsync(cancellationToken);
-                try
-                {
-                    using var innerScope = _serviceScopeFactory.CreateScope();
-                    var innerDataAccess = innerScope.ServiceProvider.GetRequiredService<IDataAccess>();
+            var sapFolderSettings = await _dataAccess.GetSapFolderSettingsAsync();
+            var sapFolderPath = sapFolderSettings.FirstOrDefault()?.Path;
+            var sapFolderName = sapFolderSettings.FirstOrDefault()?.Name;
 
-                    string filePath, fileName;
-
-                    if (!HasWindowsPath(originalFilePath))
-                    {
-                        var localFolderSettings = await _dataAccess.GetSapFolderSettingsAsync();
-                        var localFolder = localFolderSettings.FirstOrDefault();
-
-                        string localFolderPath = localFolder.Path;
-                        string localFolderClient = localFolder.Name;
-                        string localFolderIN = "In";
-                        string localFileName = Path.GetFileName(originalFilePath);
-
-                        filePath = Path.Combine(localFolderPath, localFolderClient, localFolderIN, localFileName);
-                        fileName = Path.GetFileName(filePath);
-                    }
-                    else
-                    {
-                        filePath = originalFilePath;
-                        fileName = Path.GetFileName(filePath);
-                    }
-
-                    _logger.LogInformation($"Starting processing for file: {filePath}");
-
-                    if (string.IsNullOrEmpty(targetFolder))
-                        throw new ArgumentNullException(nameof(targetFolder), "Target folder path is null or empty.");
-                    if (string.IsNullOrEmpty(fileName))
-                        throw new ArgumentNullException(nameof(fileName), "File name is null or empty.");
-
-                    var targetPath = Path.Combine(targetFolder, fileName);
-
-                    fileMappings[originalFilePath] = targetPath;
-
-                    if (File.Exists(filePath))
-                    {
-                        const int maxRetries = 3;
-                        int retryCount = 0;
-
-                        while (IsFileLocked(filePath) && retryCount < maxRetries)
-                        {
-                            _logger.LogWarning($"File {filePath} is in use, waiting to retry... (Attempt {retryCount + 1} of {maxRetries})");
-                            await Task.Delay(3000, cancellationToken);
-                            retryCount++;
-                        }
-
-                        if (!File.Exists(targetPath))
-                        {
-                            File.Copy(filePath, targetPath);
-                            _logger.LogInformation($"Copied original file to: {targetPath}");
-
-                            await innerDataAccess.AddLogEntryAsync(new LogEntry
-                            {
-                                Timestamp = DateTime.UtcNow,
-                                Level = "Information",
-                                Message = $"Copied original file: {filePath} to {targetPath}",
-                                JobId = uniqueJobId
-                            });
-                        }
-
-                        if (Path.GetExtension(filePath).ToLower() != ".pdf")
-                        {
-                            try
-                            {
-                                var convertedFilePath = await Task.Run(() => _fileConverter.ConvertToPdf(filePath, cacheFolderPDFRepairPath));
-                                await WaitForFileExistsAsync(convertedFilePath, cancellationToken);
-
-                                filePath = convertedFilePath;
-                                targetPath = Path.Combine(targetFolder, Path.GetFileName(convertedFilePath));
-
-                                fileMappings[originalFilePath] = targetPath;
-
-                                while (IsFileLocked(filePath) && retryCount < maxRetries)
-                                {
-                                    _logger.LogWarning($"File {filePath} is in use, waiting to retry... (Attempt {retryCount + 1} of {maxRetries})");
-                                    await Task.Delay(3000, cancellationToken);
-                                    retryCount++;
-                                }
-
-                                if (!File.Exists(targetPath))
-                                {
-                                    File.Copy(filePath, targetPath);
-                                    _logger.LogInformation($"Copied converted file to: {targetPath}");
-
-                                    await innerDataAccess.AddLogEntryAsync(new LogEntry
-                                    {
-                                        Timestamp = DateTime.UtcNow,
-                                        Level = "Information",
-                                        Message = $"Converted and copied file to PDF: {filePath} to {targetPath}",
-                                        JobId = uniqueJobId
-                                    });
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                var errorMessage = $"Failed to convert to PDF: {filePath} - {ex.Message}";
-                                _logger.LogError(ex, errorMessage);
-
-                                var workOrderId = await GetWorkOrderIdByFilePath(filePath, uniqueJobId);
-                                errorMessages.AddOrUpdate(workOrderId,
-                                    new ConcurrentBag<string> { errorMessage },
-                                    (_, existingBag) =>
-                                    {
-                                        existingBag.Add(errorMessage);
-                                        return existingBag;
-                                    });
-
-                                await innerDataAccess.AddLogEntryAsync(new LogEntry
-                                {
-                                    Timestamp = DateTime.UtcNow,
-                                    Level = "Error",
-                                    Message = errorMessage,
-                                    JobId = uniqueJobId
-                                });
-                            }
-                        }
-                    }
-                    else
-                    {
-                        var errorMessage = $"File not found: {filePath}";
-                        _logger.LogWarning(errorMessage);
-
-                        var workOrderId = await GetWorkOrderIdByFilePath(filePath, uniqueJobId);
-                        errorMessages.AddOrUpdate(workOrderId,
-                            new ConcurrentBag<string> { errorMessage },
-                            (_, existingBag) =>
-                            {
-                                existingBag.Add(errorMessage);
-                                return existingBag;
-                            });
-
-                        await innerDataAccess.AddLogEntryAsync(new LogEntry
-                        {
-                            Timestamp = DateTime.UtcNow,
-                            Level = "Warning",
-                            Message = errorMessage,
-                            JobId = uniqueJobId
-                        });
-                    }
-                }
-                catch (Exception ex)
-                {
-                    var errorMessage = $"Problem processing file: {originalFilePath} - {ex.Message}";
-                    _logger.LogError(ex, errorMessage);
-
-                    using var errorScope = _serviceScopeFactory.CreateScope();
-                    var errorDataAccess = errorScope.ServiceProvider.GetRequiredService<IDataAccess>();
-                    var workOrderId = await GetWorkOrderIdByFilePath(originalFilePath, uniqueJobId);
-
-                    errorMessages.AddOrUpdate(workOrderId,
-                        new ConcurrentBag<string> { errorMessage },
-                        (_, existingBag) =>
-                        {
-                            existingBag.Add(errorMessage);
-                            return existingBag;
-                        });
-
-                    await errorDataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Error", errorMessage);
-                }
-                finally
-                {
-                    _semaphore.Release();
-                }
-            });
+            var tasks = workOrderFilePaths.Select(filePath => ProcessFileAsync(
+                filePath,
+                targetFolder,
+                sapFolderPath,
+                sapFolderName,
+                fileMappings,
+                errorFilePaths,
+                errorMessages,
+                uniqueJobId,
+                cancellationToken));
 
             await Task.WhenAll(tasks);
 
-            // Preserve xml shop paper sequence and order
-            var orderedFileMappings = workOrderFilePaths
-                 .Where(fileMappings.ContainsKey)
-                 .Distinct()
-                 .ToDictionary(key => key, key => fileMappings[key]);
+            var orderedMappings = workOrderFilePaths
+                .Where(fileMappings.ContainsKey)
+                .Distinct()
+                .ToDictionary(key => key, key => fileMappings[key]);
 
-            return (orderedFileMappings, errorFilePaths.ToList());
+            return (orderedMappings, errorFilePaths.ToList());
+        }
+
+        private async Task ProcessFileAsync(
+        string originalFilePath,
+        string targetFolder,
+        string sapPath,
+        string sapClient,
+        ConcurrentDictionary<string, string> fileMappings,
+        ConcurrentBag<string> errorFilePaths,
+        ConcurrentDictionary<string, ConcurrentBag<string>> errorMessages,
+        string jobId,
+        CancellationToken cancellationToken)
+        {
+            await _semaphore.WaitAsync(cancellationToken);
+            try
+            {
+                using var scope = _serviceScopeFactory.CreateScope();
+                var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+
+                string resolvedFilePath = originalFilePath;
+                if (!HasWindowsPath(originalFilePath))
+                {
+                    var fileName = Path.GetFileName(originalFilePath);
+                    resolvedFilePath = Path.Combine(sapPath, sapClient, "In", fileName);
+                }
+
+                var fileNameOnly = Path.GetFileName(resolvedFilePath);
+                var targetPath = Path.Combine(targetFolder, fileNameOnly);
+
+                fileMappings[originalFilePath] = targetPath;
+
+                if (!File.Exists(resolvedFilePath))
+                {
+                    await HandleMissingFile(resolvedFilePath, originalFilePath, dataAccess, jobId, errorMessages);
+                    return;
+                }
+
+                if (await TryCopyWithRetry(resolvedFilePath, targetPath, cancellationToken))
+                {
+                    await dataAccess.AddLogEntryAsync(new LogEntry
+                    {
+                        Timestamp = DateTime.UtcNow,
+                        Level = "Information",
+                        Message = $"Copied original file: {resolvedFilePath} to {targetPath}",
+                        JobId = jobId
+                    });
+                }
+
+                // Convert if not PDF
+                if (Path.GetExtension(resolvedFilePath).ToLowerInvariant() != ".pdf")
+                {
+                    try
+                    {
+                        var convertedPath = await Task.Run(() =>
+                            _fileConverter.ConvertToPdf(resolvedFilePath, cacheFolderPDFRepairPath), cancellationToken);
+
+                        await WaitForFileExistsAsync(convertedPath, cancellationToken);
+
+                        var convertedTargetPath = Path.Combine(targetFolder, Path.GetFileName(convertedPath));
+
+                        fileMappings[originalFilePath] = convertedTargetPath;
+
+                        if (await TryCopyWithRetry(convertedPath, convertedTargetPath, cancellationToken))
+                        {
+                            await dataAccess.AddLogEntryAsync(new LogEntry
+                            {
+                                Timestamp = DateTime.UtcNow,
+                                Level = "Information",
+                                Message = $"Converted and copied PDF: {convertedPath} to {convertedTargetPath}",
+                                JobId = jobId
+                            });
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        await HandleFileError(ex, resolvedFilePath, originalFilePath, jobId, dataAccess, errorMessages);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                using var errorScope = _serviceScopeFactory.CreateScope();
+                var errorDataAccess = errorScope.ServiceProvider.GetRequiredService<IDataAccess>();
+                await HandleFileError(ex, originalFilePath, originalFilePath, jobId, errorDataAccess, errorMessages);
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        private async Task<bool> TryCopyWithRetry(string source, string destination, CancellationToken cancellationToken)
+        {
+            const int maxRetries = 3;
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                if (!IsFileLocked(source))
+                {
+                    if (!File.Exists(destination))
+                    {
+                        File.Copy(source, destination);
+                    }
+                    return true;
+                }
+
+                _logger.LogWarning($"File {source} is in use. Retry {attempt}/{maxRetries}.");
+                await Task.Delay(500, cancellationToken);
+            }
+
+            return false;
+        }
+
+        private async Task HandleMissingFile(
+        string resolvedPath,
+        string originalPath,
+        IDataAccess dataAccess,
+        string jobId,
+        ConcurrentDictionary<string, ConcurrentBag<string>> errorMessages)
+        {
+            string msg = $"File not found: {resolvedPath}";
+            _logger.LogWarning(msg);
+            var workOrderId = await GetWorkOrderIdByFilePath(resolvedPath, jobId);
+            AddError(errorMessages, workOrderId, msg);
+
+            await dataAccess.AddLogEntryAsync(new LogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Level = "Warning",
+                Message = msg,
+                JobId = jobId
+            });
+        }
+
+        private async Task HandleFileError(
+            Exception ex,
+            string filePath,
+            string originalPath,
+            string jobId,
+            IDataAccess dataAccess,
+            ConcurrentDictionary<string, ConcurrentBag<string>> errorMessages)
+        {
+            string msg = $"Error processing file: {filePath} - {ex.Message}";
+            _logger.LogError(ex, msg);
+            var workOrderId = await GetWorkOrderIdByFilePath(originalPath, jobId);
+            AddError(errorMessages, workOrderId, msg);
+
+            await dataAccess.UpdateWorkOrderStatusAsync(jobId, workOrderId, "Error", msg);
+        }
+
+        private void AddError(
+            ConcurrentDictionary<string, ConcurrentBag<string>> dict,
+            string key,
+            string error)
+        {
+            dict.AddOrUpdate(key,
+                _ => new ConcurrentBag<string> { error },
+                (_, bag) =>
+                {
+                    bag.Add(error);
+                    return bag;
+                });
         }
 
         /// <summary>
@@ -1602,7 +1864,7 @@ namespace PrintPlusService.Services
             }
         }
 
-        private async Task ConcatenateAndPrintFiles(string jobId, string uniqueJobId, string outFolderPath, string cacheFolderPath, string jobXmlFilePath, string jobOutFolderPath, Dictionary<string, string> urlToFilePathMapping, CancellationToken cancellationToken)
+        private async Task ConcatenateAndPrintFiles(string jobId, string uniqueJobId, string outFolderPath, string cacheFolderPath, string jobXmlFilePath, string jobOutFolderPath, Dictionary<string, string> urlToFilePathMapping, List<WorkOrderUrl> extractedUrls, CancellationToken cancellationToken)
         {
             const int maxRetries = 3;
             const int delayMilliseconds = 2000;
@@ -1626,25 +1888,59 @@ namespace PrintPlusService.Services
                         WorkOrderId = workOrder.Element("Id")?.Value,
                         Index = index,
                         TaskFactory = new Func<Task>(() =>
-                        ProcessWorkOrderAsync(workOrder, cacheFolderPath, jobId, jobOutFolderPath, urlToFilePathMapping, cancellationToken))
+                            ProcessWorkOrderAsync(workOrder, cacheFolderPath, jobId, jobOutFolderPath, urlToFilePathMapping, extractedUrls,  cancellationToken))
                     })
                     .ToList();
 
-             
-                // Await each task sequentially, preserving order
-                foreach (var entry in indexedWorkOrders.OrderBy(e => e.Index))
+                foreach (var entry in indexedWorkOrders)
                 {
-                    await entry.TaskFactory();
+                    try
+                    {
+                        var fileElement = entry.WorkOrder.Element("File");
+
+                        if (fileElement == null || string.IsNullOrWhiteSpace(fileElement.Value))
+                        {
+                            _logger.LogWarning($"Skipping work order at index {entry.Index} — missing <File> element.");
+                            continue;
+                        }
+
+                        string filePath = fileElement.Value;
+
+                        if (!IsWindowsPath(filePath))
+                        {
+                            var sapFolderSettings = await _dataAccess.GetSapFolderSettingsAsync();
+                            var sapFolderPath = sapFolderSettings.FirstOrDefault()?.Path;
+                            var sapEnvironment = sapFolderSettings.FirstOrDefault()?.Name;
+
+                            string fileName = Path.GetFileName(filePath);
+                            filePath = Path.Combine(sapFolderPath, sapEnvironment, "IN", fileName);
+                        }
+
+                        if (IsNetworkPath(filePath))
+                            filePath = fileElement.Value;
+
+                        if (!File.Exists(filePath))
+                        {
+                            _logger.LogWarning($"Skipping work order at index {entry.Index} — file does not exist: {filePath}");
+                            continue;
+                        }
+
+                        await entry.TaskFactory();
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        _logger.LogError(ex, $"Skipping work order at index {entry.Index} due to invalid work order reference.");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, $"Unhandled error while processing work order at index {entry.Index}.");
+                    }
                 }
 
                 var allWorkOrderFiles = indexedWorkOrders
-                     .Select(entry =>
-                     {
-                         var expectedFilePath = Path.Combine(outFolderPath, $"{entry.WorkOrderId}.pdf");
-                         return File.Exists(expectedFilePath) ? expectedFilePath : null;
-                     })
-                     .OrderBy(path => Path.GetFileNameWithoutExtension(path))
-                     .ToArray(); // Keep all entries, even if they are null
+                    .Select(entry => Path.Combine(outFolderPath, $"{entry.WorkOrderId}.pdf"))
+                    .Where(File.Exists)
+                    .ToArray();
 
                 var megaFilePath = Path.Combine(outFolderPath, $"{jobId}.pdf");
 
@@ -1656,14 +1952,12 @@ namespace PrintPlusService.Services
 
                     try
                     {
-                        // Retry loop with locked-file delete attempts before concatenate
                         for (int attempt = 1; attempt <= maxRetries; attempt++)
                         {
                             cancellationToken.ThrowIfCancellationRequested();
 
                             try
                             {
-                                // Attempt to delete locked file if exists before concatenate
                                 if (File.Exists(megaFilePath))
                                 {
                                     try
@@ -1674,27 +1968,24 @@ namespace PrintPlusService.Services
                                     catch (IOException ex)
                                     {
                                         _logger.LogWarning($"Attempt {attempt}: Mega file {megaFilePath} is locked, retrying after delay.");
-    
+
                                         if (attempt == maxRetries)
                                         {
                                             var msg = $"Cannot overwrite mega file {megaFilePath}. It is locked after {maxRetries} attempts.";
                                             _logger.LogError(ex, msg);
                                             throw new IOException(msg, ex);
                                         }
- 
+
                                         await Task.Delay(delayMilliseconds, cancellationToken);
-     
-                                        continue; // Retry loop
+                                        continue;
                                     }
                                 }
 
-                                // Now call the existing concatenate method
                                 await ConcatenatePdfFiles(allWorkOrderFiles, megaFilePath, jobId, null, cancellationToken);
 
                                 _logger.LogInformation($"Concatenated all work order files into mega file {megaFilePath}");
 
                                 success = true;
-
                                 break;
                             }
                             catch (IOException ioEx)
@@ -1732,10 +2023,7 @@ namespace PrintPlusService.Services
                         _semaphore.Release();
                     }
 
-                    if (!success)
-                    {
-                        return;
-                    }
+                    if (!success) return;
 
                     var megaFileDestinationPath = Path.Combine(jobOutFolderPath, Path.GetFileName(megaFilePath));
 
@@ -1763,10 +2051,10 @@ namespace PrintPlusService.Services
                     var filePath = megaFileDestinationPath;
 
                     _logger.LogInformation($"Preparing to report status 007 for Job ID {jobId} using file {filePath}");
-                    await _statusReporter.ReportStatusAsync(int.Parse(jobId), null, "007", "Work Order complete", sequence, objtyp, filePath, cancellationToken);
+                    await Task.Delay(5000, cancellationToken);
+                    await _statusReporter.ReportStatusAsync(int.Parse(jobId), null, "007", "Work Order Complete", sequence, objtyp, filePath, cancellationToken);
                     _logger.LogInformation($"Reported status 007 for Job ID {jobId}");
 
-                    // Call TrackWorkOrderRunAsync at the end of the run, passing in the user and total work order count
                     var job = await _dataAccess.GetJobByIdAsync(jobId);
                     user = job?.User ?? "UnknownUser";
                     await TrackWorkOrderRunAsync(user, workOrders.Count(), jobId);
@@ -1797,6 +2085,297 @@ namespace PrintPlusService.Services
             }
         }
 
+        //private async Task ConcatenateAndPrintFiles(string jobId, string uniqueJobId, string outFolderPath, string cacheFolderPath, string jobXmlFilePath, string jobOutFolderPath, Dictionary<string, string> urlToFilePathMapping, CancellationToken cancellationToken)
+        //{
+        //    const int maxRetries = 3;
+        //    const int delayMilliseconds = 2000;
+        //    var errorMessages = new List<string>();
+        //    string user = null;
+        //    XDocument jobXmlDocument;
+
+        //    try
+        //    {
+        //        using (var reader = new StreamReader(jobXmlFilePath, Encoding.UTF8, true))
+        //        {
+        //            jobXmlDocument = XDocument.Load(reader);
+        //        }
+
+        //        var workOrders = jobXmlDocument.Descendants("WorkOrder");
+
+        //        var indexedWorkOrders = workOrders
+        //            .Select((workOrder, index) => new
+        //            {
+        //                WorkOrder = workOrder,
+        //                WorkOrderId = workOrder.Element("Id")?.Value,
+        //                Index = index,
+        //                TaskFactory = new Func<Task>(() =>
+        //                ProcessWorkOrderAsync(workOrder, cacheFolderPath, jobId, jobOutFolderPath, urlToFilePathMapping, cancellationToken))
+        //            })
+        //            .ToList();
+
+        //        foreach (var entry in indexedWorkOrders)
+        //        {
+        //            try
+        //            {
+        //                var fileElement = entry.WorkOrder.Element("File");
+
+        //                if (fileElement == null || string.IsNullOrWhiteSpace(fileElement.Value))
+        //                {
+        //                    _logger.LogWarning($"Skipping work order at index {entry.Index} — missing <File> element.");
+        //                    continue;
+        //                }
+
+        //                string filePath = fileElement.Value;
+
+        //                if (!IsWindowsPath(filePath))
+        //                {
+        //                    // Fetch SAP folder settings
+        //                    var sapFolderSettings = await _dataAccess.GetSapFolderSettingsAsync();
+        //                    var sapFolderPath = sapFolderSettings.FirstOrDefault()?.Path;
+        //                    var sapEnvironment = sapFolderSettings.FirstOrDefault()?.Name;
+
+        //                    string fileName = Path.GetFileName(filePath);
+        //                    filePath = Path.Combine(sapFolderPath, sapEnvironment, "IN", fileName);
+        //                }
+
+        //                if (IsNetworkPath(filePath))
+        //                    filePath = fileElement.Value;
+
+        //                if (!File.Exists(filePath))
+        //                {
+        //                    _logger.LogWarning($"Skipping work order at index {entry.Index} — file does not exist: {filePath}");
+        //                    continue;
+        //                }
+
+        //                await entry.TaskFactory();
+        //            }
+        //            catch (InvalidOperationException ex)
+        //            {
+        //                _logger.LogError(ex, $"Skipping work order at index {entry.Index} due to invalid work order reference.");
+        //            }
+        //            catch (Exception ex)
+        //            {
+        //                _logger.LogError(ex, $"Unhandled error while processing work order at index {entry.Index}.");
+        //            }
+        //        }
+
+        //        //await Parallel.ForEachAsync(indexedWorkOrders, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken },
+        //        //    async (entry, _) =>
+        //        //    {
+        //        //        try
+        //        //        {
+        //        //            var fileElement = entry.WorkOrder.Element("File");
+
+        //        //            if (fileElement == null || string.IsNullOrWhiteSpace(fileElement.Value))
+        //        //            {
+        //        //                _logger.LogWarning($"Skipping work order at index {entry.Index} — missing <File> element.");
+        //        //                return;
+        //        //            }
+
+        //        //            string filePath = fileElement.Value;
+
+        //        //            if (!IsWindowsPath(filePath))
+        //        //            {
+        //        //                // Fetch SAP folder settings
+        //        //                var sapFolderSettings = await _dataAccess.GetSapFolderSettingsAsync();
+        //        //                var sapFolderPath = sapFolderSettings.FirstOrDefault()?.Path;
+        //        //                var sapEnvironment = sapFolderSettings.FirstOrDefault()?.Name;
+
+        //        //                string fileName = Path.GetFileName(filePath);
+
+        //        //                filePath = Path.Combine(sapFolderPath, sapEnvironment, "IN", fileName);
+        //        //            }
+
+        //        //            if (IsNetworkPath(filePath))
+        //        //                filePath = fileElement.Value;
+
+        //        //            if (!File.Exists(filePath))
+        //        //            {
+        //        //                _logger.LogWarning($"Skipping work order at index {entry.Index} — file does not exist: {filePath}");
+        //        //                return;
+        //        //            }
+
+        //        //            //_logger.LogInformation($"Processing work order at index {entry.Index}...");
+        //        //            await entry.TaskFactory();
+        //        //            //_logger.LogInformation($"Successfully processed work order at index {entry.Index}.");
+        //        //        }
+        //        //        catch (InvalidOperationException ex)
+        //        //        {
+        //        //            _logger.LogError(ex, $"Skipping work order at index {entry.Index} due to invalid work order reference.");
+        //        //        }
+        //        //        catch (Exception ex)
+        //        //        {
+        //        //            _logger.LogError(ex, $"Unhandled error while processing work order at index {entry.Index}.");
+        //        //        }
+        //        //    });
+
+        //        var allWorkOrderFiles = indexedWorkOrders
+        //            .Select(entry => Path.Combine(outFolderPath, $"{entry.WorkOrderId}.pdf"))
+        //            .ToArray();
+
+        //        var megaFilePath = Path.Combine(outFolderPath, $"{jobId}.pdf");
+
+        //        if (allWorkOrderFiles.Length > 0)
+        //        {
+        //            bool success = false;
+
+        //            await _semaphore.WaitAsync(cancellationToken);
+
+        //            try
+        //            {
+        //                // Retry loop with locked-file delete attempts before concatenate
+        //                for (int attempt = 1; attempt <= maxRetries; attempt++)
+        //                {
+        //                    cancellationToken.ThrowIfCancellationRequested();
+
+        //                    try
+        //                    {
+        //                        // Attempt to delete locked file if exists before concatenate
+        //                        if (File.Exists(megaFilePath))
+        //                        {
+        //                            try
+        //                            {
+        //                                using (var fs = File.Open(megaFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+        //                                File.Delete(megaFilePath);
+        //                            }
+        //                            catch (IOException ex)
+        //                            {
+        //                                _logger.LogWarning($"Attempt {attempt}: Mega file {megaFilePath} is locked, retrying after delay.");
+
+        //                                if (attempt == maxRetries)
+        //                                {
+        //                                    var msg = $"Cannot overwrite mega file {megaFilePath}. It is locked after {maxRetries} attempts.";
+        //                                    _logger.LogError(ex, msg);
+        //                                    throw new IOException(msg, ex);
+        //                                }
+
+        //                                await Task.Delay(delayMilliseconds, cancellationToken);
+
+        //                                continue; // Retry loop
+        //                            }
+        //                        }
+
+        //                        // Now call the existing concatenate method
+        //                        await ConcatenatePdfFiles(allWorkOrderFiles, megaFilePath, jobId, null, cancellationToken);
+
+        //                        _logger.LogInformation($"Concatenated all work order files into mega file {megaFilePath}");
+
+        //                        success = true;
+
+        //                        break;
+        //                    }
+        //                    catch (IOException ioEx)
+        //                    {
+        //                        var errorMessage = $"Attempt {attempt} failed to concatenate PDF files into {megaFilePath}: {ioEx.Message}";
+        //                        _logger.LogError(ioEx, errorMessage);
+
+        //                        if (attempt == maxRetries)
+        //                        {
+        //                            var finalErrorMessage = $"All {maxRetries} attempts failed to concatenate PDF files into {megaFilePath}";
+        //                            _logger.LogError(null, finalErrorMessage);
+
+        //                            using (var scope = _serviceScopeFactory.CreateScope())
+        //                            {
+        //                                var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //                                await dataAccess.AddLogEntryAsync(new LogEntry
+        //                                {
+        //                                    Timestamp = DateTime.UtcNow,
+        //                                    Level = "Error",
+        //                                    Message = finalErrorMessage,
+        //                                    Exception = ioEx.ToString()
+        //                                });
+        //                            }
+
+        //                            throw new Exception(finalErrorMessage, ioEx);
+        //                        }
+
+        //                        _logger.LogInformation($"Waiting {delayMilliseconds} milliseconds before retrying...");
+        //                        await Task.Delay(delayMilliseconds, cancellationToken);
+        //                    }
+        //                }
+        //            }
+        //            finally
+        //            {
+        //                _semaphore.Release();
+        //            }
+
+        //            if (!success)
+        //            {
+        //                return;
+        //            }
+
+        //            var megaFileDestinationPath = Path.Combine(jobOutFolderPath, Path.GetFileName(megaFilePath));
+
+        //            if (!File.Exists(megaFileDestinationPath))
+        //            {
+        //                var errorMessage = $"Mega file {megaFileDestinationPath} does not exist. Cannot proceed with '007' status call.";
+        //                _logger.LogError(null, errorMessage);
+
+        //                using (var scope = _serviceScopeFactory.CreateScope())
+        //                {
+        //                    var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //                    await dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Error",
+        //                        Message = errorMessage
+        //                    });
+        //                }
+
+        //                return;
+        //            }
+
+        //            var sequence = "0001";
+        //            var objtyp = "OBJ_TYP";
+        //            var filePath = megaFileDestinationPath;
+
+        //           // _printerService.GetMegaFilePath(jobId, filePath);
+
+        //            _logger.LogInformation($"Preparing to report status 007 for Job ID {jobId} using file {filePath}");
+        //            await Task.Delay(5000, cancellationToken);
+        //            await _statusReporter.ReportStatusAsync(int.Parse(jobId), null, "007", "Work Order Complete", sequence, objtyp, filePath, cancellationToken);
+        //            _logger.LogInformation($"Reported status 007 for Job ID {jobId}");
+
+        //            // Call TrackWorkOrderRunAsync at the end of the run, passing in the user and total work order count
+        //            var job = await _dataAccess.GetJobByIdAsync(jobId);
+        //            user = job?.User ?? "UnknownUser";
+        //            await TrackWorkOrderRunAsync(user, workOrders.Count(), jobId);
+        //        }
+        //        else
+        //        {
+        //            _logger.LogWarning($"No work order files found to concatenate into mega file for job {jobId}");
+        //        }
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        using (var scope = _serviceScopeFactory.CreateScope())
+        //        {
+        //            var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //            await dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+
+        //            await dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Error",
+        //                Message = $"Error concatenating and printing files for job {jobId}",
+        //                Exception = ex.ToString()
+        //            });
+        //        }
+
+        //        _logger.LogError(ex, $"Error concatenating and printing files for job {jobId}");
+        //        throw;
+        //    }
+        //}
+
+        public bool IsNetworkPath(string path)
+        {
+            if (Uri.TryCreate(path, UriKind.Absolute, out Uri uri))
+            {
+                return uri.IsUnc;
+            }
+
+            return path.StartsWith(@"\\"); // fallback check
+        }
 
         // Helper method to check if the file is locked by another process
         private bool IsFileLocked(string filePath)
@@ -1862,6 +2441,24 @@ namespace PrintPlusService.Services
             return false; // Still locked after retries
         }
 
+        private static bool IsWindowsPath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return false;
+
+            // Check if it's rooted and has backslashes
+            if (!Path.IsPathRooted(path)) return false;
+
+            // Check for drive letter path like "C:\"
+            if (Regex.IsMatch(path, @"^[a-zA-Z]:\\"))
+                return true;
+
+            // Check for UNC path like "\\server\share"
+            if (path.StartsWith(@"\\"))
+                return true;
+
+            return false;
+        }
+
 
         /// <summary>
         /// Processes an individual work order by handling its file parts, concatenating them into a single PDF,
@@ -1882,22 +2479,27 @@ namespace PrintPlusService.Services
         /// This method relies on dependency-injected services for database access, logging, and SAP communication
         /// and uses a scoped data access object to ensure that each database operation is executed within a controlled scope.
         /// </summary>
-        private async Task ProcessWorkOrderAsync(XElement workOrder, string cacheFolderPath, string jobId, string jobOutFolderPath, Dictionary<string, string> urlToFilePathMapping, CancellationToken cancellationToken)
+        /// 
+        // Updated ProcessWorkOrderAsync using ConcurrentDictionary for thread safety
+        // With file lock and readiness protection
+        private async Task ProcessWorkOrderAsync(XElement workOrder, string cacheFolderPath, string jobId, string jobOutFolderPath, Dictionary<string, string> urlToFilePathMapping, List<WorkOrderUrl> extractedUrls, CancellationToken cancellationToken)
         {
             var workOrderId = workOrder.Element("Id").Value;
             var concatenatedFilePath = Path.Combine(cacheFolderPath, $"{workOrderId}.pdf");
-            var filesToConcatenate = new HashSet<string>();
-            var filesSet = new HashSet<string>();
+            var filesToConcatenate = new ConcurrentDictionary<string, byte>();
+            var filesSet = new ConcurrentDictionary<string, byte>();
             var finalStatus = "Processed";
             string uniqueJobId = null;
             string user = null;
             var sequence = "0001";
             var objtyp = "BUS2007";
 
-            // --- File Locking (Essential for concurrent file access) ---
-            string lockKey = concatenatedFilePath.ToLowerInvariant();
+            string lockKey = Path.GetFullPath(concatenatedFilePath).ToLowerInvariant().Replace('\\', '/');
+        
             var lockEntry = _fileLocks.GetOrAdd(lockKey, _ => new FileLockEntry());
             lockEntry.LastUsed = DateTime.UtcNow;
+
+            var fileOrderList = new List<string>();
 
             await lockEntry.Semaphore.WaitAsync(cancellationToken);
 
@@ -1909,7 +2511,7 @@ namespace PrintPlusService.Services
 
                 if (File.Exists(mainCachedFilePath))
                 {
-                    filesToConcatenate.Add(mainCachedFilePath);
+                    filesToConcatenate.TryAdd(mainCachedFilePath, 0);
                 }
                 else
                 {
@@ -1925,16 +2527,22 @@ namespace PrintPlusService.Services
                 }
 
                 var workOrderParts = workOrder.Descendants("WorkOrderPart");
-            
-                var orderedPartTasks = workOrderParts
-                    .Select((part, index) => new
+
+                foreach (var part in workOrderParts)
+                {
+                    var filePath = part.Element("FilePath")?.Value;
+                    if (!string.IsNullOrWhiteSpace(filePath))
                     {
-                        Task = ProcessWorkOrderPartAsync(part, filesToConcatenate, filesSet, cacheFolderPath, workOrderId, jobId, urlToFilePathMapping, cancellationToken),
-                        OriginalIndex = index
-                    })
-                    .ToList();
-           
-                // Await in original XML order
+                        fileOrderList.Add(filePath);
+                    }
+                }
+
+                var orderedPartTasks = workOrderParts.Select((part, index) => new
+                {
+                    Task = ProcessWorkOrderPartAsync(part, filesToConcatenate, filesSet, cacheFolderPath, workOrderId, jobId, urlToFilePathMapping, cancellationToken),
+                    OriginalIndex = index
+                }).ToList();
+
                 foreach (var partTask in orderedPartTasks.OrderBy(t => t.OriginalIndex))
                 {
                     await partTask.Task;
@@ -1943,8 +2551,6 @@ namespace PrintPlusService.Services
                 using (var scope = _serviceScopeFactory.CreateScope())
                 {
                     var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
-
-                    // Fetch the Job and its UniqueJobId
                     var job = await dataAccess.GetJobByIdAsync(jobId);
                     if (job == null)
                     {
@@ -1952,8 +2558,6 @@ namespace PrintPlusService.Services
                     }
                     uniqueJobId = job.UniqueJobId;
                     user = job.User;
-
-                    _logger.LogInformation($"Using UniqueJobId: {uniqueJobId} for WorkOrderId: {workOrderId}");
 
                     await _dataAccess.AddLogEntryAsync(new LogEntry
                     {
@@ -1964,16 +2568,21 @@ namespace PrintPlusService.Services
                         WorkOrderId = workOrderId
                     });
 
+
                     if (filesToConcatenate.Count > 0)
                     {
                         try
                         {
+                            // Now sort only the relevant files
+                            var sortedFilesArray = SortFiles(filesToConcatenate.Keys, fileOrderList, urlToFilePathMapping, extractedUrls);
 
-                            var sortedFilesArray = SortFiles(filesToConcatenate);
+                            if (!WaitForFileReady(sortedFilesArray[0]))
+                            {
+                                throw new IOException("File not ready for concatenation: " + sortedFilesArray[0]);
+                            }
 
                             await ConcatenatePdfFiles(sortedFilesArray, concatenatedFilePath, jobId, workOrderId, cancellationToken);
 
-                            _logger.LogInformation($"Concatenated files for work order {workOrderId} into {concatenatedFilePath}");
                             await _dataAccess.AddLogEntryAsync(new LogEntry
                             {
                                 Timestamp = DateTime.UtcNow,
@@ -1983,35 +2592,16 @@ namespace PrintPlusService.Services
                                 WorkOrderId = workOrderId
                             });
 
-                            using (var innerScope = _serviceScopeFactory.CreateScope())
+                            string outFilePath = Path.Combine(jobOutFolderPath, Path.GetFileName(concatenatedFilePath));
+                            string outLockKey = Path.GetFullPath(outFilePath).ToLowerInvariant();
+                            var outLock = _fileLocks.GetOrAdd(outLockKey, _ => new FileLockEntry());
+
+                            await outLock.Semaphore.WaitAsync();
+                            try
                             {
-                                var innerDataAccess = innerScope.ServiceProvider.GetRequiredService<IDataAccess>();
-
-                                var sendToPrinterSetting = await innerDataAccess.GetConfigurationSettingAsync("AppSettings", "SendToPrinter");
-                                var sendToPrinter = sendToPrinterSetting != null && bool.Parse(sendToPrinterSetting.Value);
-
-                                var printLocation = job.Print;
-                                var printerName = job.Printer ?? "ProdPrinter";
-
-                                var printerSetting = await dataAccess.GetPrinterSettingByShortNameAsync(printerName);
-
-                                var defaultPrinterSetting = await innerDataAccess.GetConfigurationSettingAsync("AppSettings", "DefaultPrinterName");
-
-                                sequence = workOrderParts.FirstOrDefault()?.Element("SeqId")?.Value ?? "0001";
-                                objtyp = workOrder.Element("Objtyp")?.Value ?? "BUS2007";
-                                var filePath = workOrder.Element("File").Value;
-
-                                string statusCodeSuccess = "037";
-                                string statusCodeFailure = "009";
-                                string statusMessageSuccess = "Work Order complete";
-
-                                // Move the file to the Out folder before making the RFC call for status "037"
-                                var outFilePath = Path.Combine(jobOutFolderPath, Path.GetFileName(concatenatedFilePath));
                                 if (!File.Exists(outFilePath))
                                 {
-                                    File.Move(concatenatedFilePath, outFilePath); // Move file from cache to Out folder
-                                    _logger.LogInformation($"Moved work order file {workOrderId} to {outFilePath}");
-
+                                    File.Move(concatenatedFilePath, outFilePath);
                                     await _dataAccess.AddLogEntryAsync(new LogEntry
                                     {
                                         Timestamp = DateTime.UtcNow,
@@ -2021,275 +2611,114 @@ namespace PrintPlusService.Services
                                         WorkOrderId = workOrderId
                                     });
                                 }
-                                else
-                                {
-                                    _logger.LogWarning($"File {outFilePath} already exists, skipping move.");
-
-                                    await _dataAccess.AddLogEntryAsync(new LogEntry
-                                    {
-                                        Timestamp = DateTime.UtcNow,
-                                        Level = "Warning",
-                                        Message = $"File {outFilePath} already exists, skipping move.",
-                                        JobId = jobId,
-                                        WorkOrderId = workOrderId
-                                    });
-                                }
-
-                                // Use the updated path from the Out folder for the RFC call
                                 concatenatedFilePath = outFilePath;
+                            }
+                            finally
+                            {
+                                outLock.Semaphore.Release();
+                            }
 
-                                if (printerSetting == null && printLocation == "N")
+                            if (!WaitForFileReady(concatenatedFilePath))
+                            {
+                                throw new IOException("Concatenated file not ready for printing: " + concatenatedFilePath);
+                            }
+
+                            var printerName = job.Printer ?? "ProdPrinter";
+                            var printerSetting = await dataAccess.GetPrinterSettingByShortNameAsync(printerName);
+                            var sendToPrinterSetting = await dataAccess.GetConfigurationSettingAsync("AppSettings", "SendToPrinter");
+                            bool sendToPrinter = sendToPrinterSetting != null && bool.Parse(sendToPrinterSetting.Value);
+                            var printLocation = job.Print;
+                            sequence = workOrderParts.FirstOrDefault()?.Element("SeqId")?.Value ?? "0001";
+                            objtyp = workOrder.Element("Objtyp")?.Value ?? "BUS2007";
+
+                            string statusCodeSuccess = "037";
+                            string statusCodeFailure = "009";
+                            string statusMessageSuccess = "Work Order complete";
+
+                            if (sendToPrinter)
+                            {
+                                var printLockKey = Path.GetFullPath(concatenatedFilePath).ToLowerInvariant();
+                                var printLock = _fileLocks.GetOrAdd(printLockKey, _ => new FileLockEntry());
+
+                                await printLock.Semaphore.WaitAsync();
+
+                                try
                                 {
-                                    hasError = true;
-                                    string errorMessage = $"Printer with name {printerName} not found. File {concatenatedFilePath} was not sent to the printer.";
-                                    var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
-                                    var errorMessages = new List<string> { errorMessage };
-                                    AddErrorPdfMessages(errorFilePath, errorMessages);
-                                    await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
-                                    await dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-                                    await dataAccess.AddLogEntryAsync(new LogEntry { Timestamp = DateTime.UtcNow, Level = "Error", Message = $"Updated job status to 'Error' due to printer error for JobId: {jobId}.", JobId = jobId, WorkOrderId = workOrderId });
+                                    _printerService.PrintFileAsync(
+                                        printLocation == "N" ? printerSetting?.ShortName ?? printerName : printerName,
+                                        concatenatedFilePath,
+                                        jobId,
+                                        printLocation,
+                                        workOrderId,
+                                        sequence,
+                                        objtyp);
                                 }
-                                else if (sendToPrinter)
+                                finally
                                 {
-                                    try
-                                    {
-                                        await _printerService.PrintFileAsync(printLocation == "N" ? printerSetting.ShortName : printerName, concatenatedFilePath, jobId, printLocation);
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        hasError = true;
-                                        string errorMessage = $"Error sending to printer for work order {workOrderId}: {ex.Message}";
-                                        //await HandleProcessingErrorAsync(workOrderId, errorMessage, cacheFolderPath, jobId, uniqueJobId, sequence, objtyp, concatenatedFilePath, dataAccess, cancellationToken);
-                                        throw;
-                                    }
+                                    printLock.Semaphore.Release();
                                 }
-                                else
+                            }
+
+                            if (finalStatus != "Error" && !File.Exists(Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf")))
+                            {
+                                var innerDataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+
+                                await innerDataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Processed", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+                                await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Processed", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+
+                                await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, statusCodeSuccess, statusMessageSuccess, sequence, objtyp, concatenatedFilePath, cancellationToken);
+
+                                await _dataAccess.AddLogEntryAsync(new LogEntry
                                 {
-                                    hasError = true;
-                                    string errorMessage = "Printing is currently disabled. Please enable printing in the system configuration.";
-                                    var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
-                                    var errorMessages = new List<string> { errorMessage };
-                                    AddErrorPdfMessages(errorFilePath, errorMessages);
-                                    await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
-                                    await dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-                                    await dataAccess.AddLogEntryAsync(new LogEntry { Timestamp = DateTime.UtcNow, Level = "Error", Message = $"Updated job status to 'Error' because printing is disabled for JobId: {jobId}.", JobId = jobId, WorkOrderId = workOrderId });
-                                }
+                                    Timestamp = DateTime.UtcNow,
+                                    Level = "Information",
+                                    Message = $"WorkOrder ID {workOrderId} marked as 'Processed' successfully.",
+                                    JobId = jobId,
+                                    WorkOrderId = workOrderId
+                                });
 
-                                // Check for error PDF before setting final status
-                                if (finalStatus != "Error" && !File.Exists(Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf")))
+                                await _dataAccess.AddLogEntryAsync(new LogEntry
                                 {
-                                    // Update the work order status to Processed
-                                    await innerDataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Processed", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-                                    await _dataAccess.AddLogEntryAsync(new LogEntry
-                                    {
-                                        Timestamp = DateTime.UtcNow,
-                                        Level = "Information",
-                                        Message = $"WorkOrder ID {workOrderId} marked as 'Processed' successfully.",
-                                        JobId = jobId,
-                                        WorkOrderId = workOrderId
-                                    });
-
-                                    // Update job status to Processed
-                                    await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Processed", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-                                    await _dataAccess.AddLogEntryAsync(new LogEntry
-                                    {
-                                        Timestamp = DateTime.UtcNow,
-                                        Level = "Information",
-                                        Message = $"Job ID {jobId} marked as 'Processed' successfully.",
-                                        JobId = jobId,
-                                        WorkOrderId = workOrderId
-                                    });
-
-                                    // Make the RFC call to SAP for this specific work order success
-                                    await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, statusCodeSuccess, statusMessageSuccess, sequence, objtyp, concatenatedFilePath, cancellationToken);
-                                    _logger.LogInformation($"Reported status 'Processed' for WorkOrder ID {workOrderId}");
-
-                                    // Log the success status report to SAP in the database
-                                    await _dataAccess.AddLogEntryAsync(new LogEntry
-                                    {
-                                        Timestamp = DateTime.UtcNow,
-                                        Level = "Information",
-                                        Message = $"Reported status 'Processed' to SAP for WorkOrder ID {workOrderId}.",
-                                        JobId = jobId,
-                                        WorkOrderId = workOrderId
-                                    });
-                                }
-
-                                else
-                                {
-                                    finalStatus = "Error";
-                                    hasError = true;
-
-                                    sequence = workOrderParts.FirstOrDefault()?.Element("SeqId")?.Value ?? "0001";
-                                    objtyp = workOrder.Element("Objtyp")?.Value ?? "BUS2007";
-
-                                    // Initialize error file path and write the error message to the PDF
-                                    string errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
-
-                                    var errorMessage = $"An error occurred during processing. Please review the Error work order file {errorFilePath}";
-
-                                    // Log error creation in the database
-                                    await _dataAccess.AddLogEntryAsync(new LogEntry
-                                    {
-                                        Timestamp = DateTime.UtcNow,
-                                        Level = "Error",
-                                        Message = $"WorkOrder ID {workOrderId} encountered an error. Created error PDF at {errorFilePath}.",
-                                        JobId = jobId,
-                                        WorkOrderId = workOrderId
-                                    });
-
-                                    // Send the error status to SAP
-                                    await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, "009", errorMessage, sequence, objtyp, errorFilePath, cancellationToken);
-                                    await _dataAccess.AddLogEntryAsync(new LogEntry
-                                    {
-                                        Timestamp = DateTime.UtcNow,
-                                        Level = "Information",
-                                        Message = $"Reported error status to SAP for WorkOrder ID {workOrderId} with message: {errorMessage}.",
-                                        JobId = jobId,
-                                        WorkOrderId = workOrderId
-                                    });
-
-                                    _logger.LogInformation($"Reported error status to SAP for WorkOrder ID {workOrderId} due to finalStatus being 'Error'.");
-                                }
-
+                                    Timestamp = DateTime.UtcNow,
+                                    Level = "Information",
+                                    Message = $"Reported status 'Processed' to SAP for WorkOrder ID {workOrderId}.",
+                                    JobId = jobId,
+                                    WorkOrderId = workOrderId
+                                });
                             }
                         }
                         catch (Exception ex)
                         {
                             hasError = true;
-                            _logger.LogError(ex, $"Error concatenating files for work order {workOrderId}");
-
-                            // Log error to the database
-                            await _dataAccess.AddLogEntryAsync(new LogEntry
-                            {
-                                Timestamp = DateTime.UtcNow,
-                                Level = "Error",
-                                Message = $"Error concatenating files for work order {workOrderId}: {ex.Message}",
-                                JobId = jobId,
-                                WorkOrderId = workOrderId
-                            });
-
                             var errorMessages = new List<string> { ex.Message };
                             await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
-
                             var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
                             AddErrorPdfMessages(errorFilePath, errorMessages);
 
                             if (File.Exists(errorFilePath))
                             {
-                                filesToConcatenate.Add(errorFilePath);
-
-                                await ConcatenatePdfFiles(filesToConcatenate.ToArray(), concatenatedFilePath, jobId, workOrderId, cancellationToken);
-
-                                // Log the addition of error files to concatenation in the database
-                                await _dataAccess.AddLogEntryAsync(new LogEntry
-                                {
-                                    Timestamp = DateTime.UtcNow,
-                                    Level = "Information",
-                                    Message = $"Added error file {errorFilePath} for concatenation for work order {workOrderId}.",
-                                    JobId = jobId,
-                                    WorkOrderId = workOrderId
-                                });
+                                filesToConcatenate.TryAdd(errorFilePath, 0);
+                                await ConcatenatePdfFiles(filesToConcatenate.Keys.ToArray(), concatenatedFilePath, jobId, workOrderId, cancellationToken);
                             }
 
-                            await _dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-                            await _dataAccess.AddLogEntryAsync(new LogEntry
-                            {
-                                Timestamp = DateTime.UtcNow,
-                                Level = "Error",
-                                Message = $"Updated work order status to 'Error' for WorkOrderId: {workOrderId}.",
-                                JobId = jobId,
-                                WorkOrderId = workOrderId
-                            });
-
-                            // Update job status to Error
                             await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-                            await _dataAccess.AddLogEntryAsync(new LogEntry
-                            {
-                                Timestamp = DateTime.UtcNow,
-                                Level = "Error",
-                                Message = $"Updated job status to 'Error' for JobId: {jobId} with UniqueJobId: {uniqueJobId}.",
-                                JobId = jobId,
-                                WorkOrderId = workOrderId
-                            });
-
-                            // Send the error status to SAP
                             await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, "009", ex.Message, sequence, objtyp, errorFilePath, cancellationToken);
-                            await _dataAccess.AddLogEntryAsync(new LogEntry
-                            {
-                                Timestamp = DateTime.UtcNow,
-                                Level = "Information",
-                                Message = $"Reported error status to SAP for WorkOrderId: {workOrderId} with error message: {ex.Message}.",
-                                JobId = jobId,
-                                WorkOrderId = workOrderId
-                            });
-
-                            throw;
                         }
-
                     }
                     else
                     {
                         hasError = true;
                         var errorMessage = $"No files found to concatenate for work order {workOrderId}";
                         _logger.LogWarning(errorMessage);
-
-                        // Log warning to the database
-                        await _dataAccess.AddLogEntryAsync(new LogEntry
-                        {
-                            Timestamp = DateTime.UtcNow,
-                            Level = "Warning",
-                            Message = errorMessage,
-                            JobId = jobId,
-                            WorkOrderId = workOrderId
-                        });
-
                         var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
                         var errorMessages = new List<string> { errorMessage };
                         AddErrorPdfMessages(errorFilePath, errorMessages);
-
-                        filesToConcatenate.Add(errorFilePath);
-
-                        // Save error details to the database
+                        filesToConcatenate.TryAdd(errorFilePath, 0);
                         await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
-
-                        // Attempt to concatenate error PDF files
-                        await ConcatenatePdfFiles(filesToConcatenate.ToArray(), concatenatedFilePath, jobId, workOrderId, cancellationToken);
-
-                        // Update the work order status to "Error" in the database
-                        await _dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-                        await _dataAccess.AddLogEntryAsync(new LogEntry
-                        {
-                            Timestamp = DateTime.UtcNow,
-                            Level = "Error",
-                            Message = $"Updated work order status to 'Error' for WorkOrderId: {workOrderId}",
-                            JobId = jobId,
-                            WorkOrderId = workOrderId
-                        });
-
-                        // Update the job status to "Error" in the database
+                        await ConcatenatePdfFiles(filesToConcatenate.Keys.ToArray(), concatenatedFilePath, jobId, workOrderId, cancellationToken);
                         await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-                        await _dataAccess.AddLogEntryAsync(new LogEntry
-                        {
-                            Timestamp = DateTime.UtcNow,
-                            Level = "Error",
-                            Message = $"Updated job status to 'Error' for JobId: {jobId} with UniqueJobId: {uniqueJobId}",
-                            JobId = jobId,
-                            WorkOrderId = workOrderId
-                        });
-
-                        // Send the error status to SAP
                         await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, "009", errorMessage, sequence, objtyp, errorFilePath, cancellationToken);
-                        await _dataAccess.AddLogEntryAsync(new LogEntry
-                        {
-                            Timestamp = DateTime.UtcNow,
-                            Level = "Information",
-                            Message = $"Reported error status to SAP for WorkOrderId: {workOrderId} with error message: {errorMessage}",
-                            JobId = jobId,
-                            WorkOrderId = workOrderId
-                        });
                     }
-
                 }
             }
             catch (Exception ex)
@@ -2297,27 +2726,10 @@ namespace PrintPlusService.Services
                 hasError = true;
                 var errorMessages = new List<string> { ex.Message };
                 await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
-
-                await _dataAccess.AddLogEntryAsync(new LogEntry
-                {
-                    Timestamp = DateTime.UtcNow,
-                    Level = "Error",
-                    Message = $"Failed to process work order {workOrderId}: {ex.Message}",
-                    JobId = jobId,
-                    WorkOrderId = workOrderId
-                });
-
                 var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
                 AddErrorPdfMessages(errorFilePath, errorMessages);
-
-                await _dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-
-                // Update job status to Error
                 await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-
-                // Send the error status to SAP
                 await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, "009", ex.Message, sequence, objtyp, errorFilePath, cancellationToken);
-
                 throw;
             }
             finally
@@ -2326,6 +2738,716 @@ namespace PrintPlusService.Services
                 lockEntry.LastUsed = DateTime.UtcNow;
             }
         }
+
+        //private async Task ProcessWorkOrderAsync(XElement workOrder, string cacheFolderPath, string jobId, string jobOutFolderPath, Dictionary<string, string> urlToFilePathMapping, CancellationToken cancellationToken)
+        //{
+        //    var workOrderId = workOrder.Element("Id").Value;
+        //    var concatenatedFilePath = Path.Combine(cacheFolderPath, $"{workOrderId}.pdf");
+        //    var filesToConcatenate = new ConcurrentDictionary<string, byte>();
+        //    var filesSet = new ConcurrentDictionary<string, byte>();
+        //    var finalStatus = "Processed";
+        //    string uniqueJobId = null;
+        //    string user = null;
+        //    var sequence = "0001";
+        //    var objtyp = "BUS2007";
+
+        //    string lockKey = Path.GetFullPath(concatenatedFilePath).ToLowerInvariant().Replace('\\', '/');
+        //    var lockEntry = _fileLocks.GetOrAdd(lockKey, _ => new FileLockEntry());
+        //    lockEntry.LastUsed = DateTime.UtcNow;
+
+        //    var fileOrderList = new List<string>();
+
+        //    await lockEntry.Semaphore.WaitAsync(cancellationToken);
+
+        //    try
+        //    {
+        //        var mainFilePath = workOrder.Element("File").Value;
+        //        var mainFileName = Path.GetFileName(mainFilePath);
+        //        var mainCachedFilePath = Path.Combine(cacheFolderPath, mainFileName);
+
+        //        if (File.Exists(mainCachedFilePath))
+        //        {
+        //            filesToConcatenate.TryAdd(mainCachedFilePath, 0);
+        //        }
+        //        else
+        //        {
+        //            _logger.LogWarning($"File not found in cache folder: {mainCachedFilePath}");
+        //            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Warning",
+        //                Message = $"File not found in cache folder: {mainCachedFilePath}",
+        //                JobId = jobId,
+        //                WorkOrderId = workOrderId
+        //            });
+        //        }
+
+        //        var workOrderParts = workOrder.Descendants("WorkOrderPart");
+
+        //        foreach (var part in workOrderParts)
+        //        {
+        //            var filePath = part.Element("FilePath")?.Value;
+        //            if (!string.IsNullOrWhiteSpace(filePath))
+        //            {
+        //                fileOrderList.Add(filePath);
+        //            }
+        //        }
+
+        //        var orderedPartTasks = workOrderParts.Select((part, index) => new
+        //        {
+        //            Task = ProcessWorkOrderPartAsync(part, filesToConcatenate, filesSet, cacheFolderPath, workOrderId, jobId, urlToFilePathMapping, cancellationToken),
+        //            OriginalIndex = index
+        //        }).ToList();
+
+        //        foreach (var partTask in orderedPartTasks.OrderBy(t => t.OriginalIndex))
+        //        {
+        //            await partTask.Task;
+        //        }
+
+        //        using (var scope = _serviceScopeFactory.CreateScope())
+        //        {
+        //            var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //            var job = await dataAccess.GetJobByIdAsync(jobId);
+        //            if (job == null)
+        //            {
+        //                throw new Exception($"Job with ID {jobId} not found.");
+        //            }
+        //            uniqueJobId = job.UniqueJobId;
+        //            user = job.User;
+
+        //            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Information",
+        //                Message = $"Using UniqueJobId: {uniqueJobId} for WorkOrderId: {workOrderId}",
+        //                JobId = jobId,
+        //                WorkOrderId = workOrderId
+        //            });
+
+        //            if (filesToConcatenate.Count > 0)
+        //            {
+        //                try
+        //                {
+        //                    var sortedFilesArray = SortFiles(filesToConcatenate.Keys, fileOrderList, urlToFilePathMapping);
+
+        //                    if (!WaitForFileReady(sortedFilesArray[0]))
+        //                    {
+        //                        throw new IOException("File not ready for concatenation: " + sortedFilesArray[0]);
+        //                    }
+
+        //                    await ConcatenatePdfFiles(sortedFilesArray, concatenatedFilePath, jobId, workOrderId, cancellationToken);
+
+        //                    await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Information",
+        //                        Message = $"Concatenated files for work order {workOrderId} into {concatenatedFilePath}",
+        //                        JobId = jobId,
+        //                        WorkOrderId = workOrderId
+        //                    });
+
+        //                    string outFilePath = Path.Combine(jobOutFolderPath, Path.GetFileName(concatenatedFilePath));
+        //                    string outLockKey = Path.GetFullPath(outFilePath).ToLowerInvariant();
+        //                    var outLock = _fileLocks.GetOrAdd(outLockKey, _ => new FileLockEntry());
+
+        //                    await outLock.Semaphore.WaitAsync();
+        //                    try
+        //                    {
+        //                        if (!File.Exists(outFilePath))
+        //                        {
+        //                            File.Move(concatenatedFilePath, outFilePath);
+        //                            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                            {
+        //                                Timestamp = DateTime.UtcNow,
+        //                                Level = "Information",
+        //                                Message = $"Moved work order file {workOrderId} to {outFilePath}",
+        //                                JobId = jobId,
+        //                                WorkOrderId = workOrderId
+        //                            });
+        //                        }
+        //                        concatenatedFilePath = outFilePath;
+        //                    }
+        //                    finally
+        //                    {
+        //                        outLock.Semaphore.Release();
+        //                    }
+
+        //                    if (!WaitForFileReady(concatenatedFilePath))
+        //                    {
+        //                        throw new IOException("Concatenated file not ready for printing: " + concatenatedFilePath);
+        //                    }
+
+        //                    var printerName = job.Printer ?? "ProdPrinter";
+        //                    var printerSetting = await dataAccess.GetPrinterSettingByShortNameAsync(printerName);
+        //                    var sendToPrinterSetting = await dataAccess.GetConfigurationSettingAsync("AppSettings", "SendToPrinter");
+        //                    bool sendToPrinter = sendToPrinterSetting != null && bool.Parse(sendToPrinterSetting.Value);
+        //                    var printLocation = job.Print;
+        //                    sequence = workOrderParts.FirstOrDefault()?.Element("SeqId")?.Value ?? "0001";
+        //                    objtyp = workOrder.Element("Objtyp")?.Value ?? "BUS2007";
+
+        //                    string statusCodeSuccess = "037";
+        //                    string statusCodeFailure = "009";
+        //                    string statusMessageSuccess = "Work Order complete";
+
+        //                    if (sendToPrinter)
+        //                    {
+        //                        var printLockKey = Path.GetFullPath(concatenatedFilePath).ToLowerInvariant();
+        //                        var printLock = _fileLocks.GetOrAdd(printLockKey, _ => new FileLockEntry());
+
+        //                        await printLock.Semaphore.WaitAsync();
+
+        //                        try
+        //                        {
+        //                            _printerService.PrintFileAsync(
+        //                                printLocation == "N" ? printerSetting?.ShortName ?? printerName : printerName,
+        //                                concatenatedFilePath,
+        //                                jobId,
+        //                                printLocation,
+        //                                workOrderId,
+        //                                sequence,
+        //                                objtyp);
+        //                        }
+        //                        finally
+        //                        {
+        //                            printLock.Semaphore.Release();
+        //                        }
+        //                    }
+
+
+
+        //                }
+        //                catch (Exception ex)
+        //                {
+        //                    hasError = true;
+        //                    var errorMessages = new List<string> { ex.Message };
+        //                    await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
+        //                    var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
+        //                    AddErrorPdfMessages(errorFilePath, errorMessages);
+
+        //                    if (File.Exists(errorFilePath))
+        //                    {
+        //                        filesToConcatenate.TryAdd(errorFilePath, 0);
+        //                        await ConcatenatePdfFiles(filesToConcatenate.Keys.ToArray(), concatenatedFilePath, jobId, workOrderId, cancellationToken);
+        //                    }
+
+        //                    await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //                    await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, "009", ex.Message, sequence, objtyp, errorFilePath, cancellationToken);
+        //                }
+        //            }
+        //            else
+        //            {
+        //                hasError = true;
+        //                var errorMessage = $"No files found to concatenate for work order {workOrderId}";
+        //                _logger.LogWarning(errorMessage);
+        //                var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
+        //                var errorMessages = new List<string> { errorMessage };
+        //                AddErrorPdfMessages(errorFilePath, errorMessages);
+        //                filesToConcatenate.TryAdd(errorFilePath, 0);
+        //                await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
+        //                await ConcatenatePdfFiles(filesToConcatenate.Keys.ToArray(), concatenatedFilePath, jobId, workOrderId, cancellationToken);
+        //                await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //                await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, "009", errorMessage, sequence, objtyp, errorFilePath, cancellationToken);
+        //            }
+        //        }
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        hasError = true;
+        //        var errorMessages = new List<string> { ex.Message };
+        //        await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
+        //        var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
+        //        AddErrorPdfMessages(errorFilePath, errorMessages);
+        //        await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //        await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, "009", ex.Message, sequence, objtyp, errorFilePath, cancellationToken);
+        //        throw;
+        //    }
+        //    finally
+        //    {
+        //        lockEntry.Semaphore.Release();
+        //        lockEntry.LastUsed = DateTime.UtcNow;
+        //    }
+        //}
+
+        private bool WaitForFileReady(string path, int retries = 10, int delayMs = 250)
+        {
+            for (int i = 0; i < retries; i++)
+            {
+                try
+                {
+                    using (FileStream fs = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                        return true;
+                }
+                catch (IOException)
+                {
+                    Thread.Sleep(delayMs);
+                }
+            }
+            _logger.LogWarning("File is locked or not ready after retries: {Path}" + path);
+            return false;
+        }
+
+
+        //private async Task ProcessWorkOrderAsync(XElement workOrder, string cacheFolderPath, string jobId, string jobOutFolderPath, Dictionary<string, string> urlToFilePathMapping, CancellationToken cancellationToken)
+        //{
+        //    var workOrderId = workOrder.Element("Id").Value;
+        //    var concatenatedFilePath = Path.Combine(cacheFolderPath, $"{workOrderId}.pdf");
+        //    var filesToConcatenate = new HashSet<string>();
+        //    //var filesToConcatenate = new List<string>();
+        //    var filesSet = new HashSet<string>();
+        //    var finalStatus = "Processed";
+        //    string uniqueJobId = null;
+        //    string user = null;
+        //    var sequence = "0001";
+        //    var objtyp = "BUS2007";
+        //    //bool isFirstCallbackSent = false;
+        //    //string firstCallbackWorkOrderId = string.Empty;
+
+        //    // --- File Locking (Essential for concurrent file access) ---
+        //    string lockKey = concatenatedFilePath.ToLowerInvariant();
+        //    var lockEntry = _fileLocks.GetOrAdd(lockKey, _ => new FileLockEntry());
+        //    lockEntry.LastUsed = DateTime.UtcNow;
+
+        //    var fileOrderList = new List<string>();
+
+        //    await lockEntry.Semaphore.WaitAsync(cancellationToken);
+
+        //    try
+        //    {
+        //        var mainFilePath = workOrder.Element("File").Value;
+        //        var mainFileName = Path.GetFileName(mainFilePath);
+        //        var mainCachedFilePath = Path.Combine(cacheFolderPath, mainFileName);
+
+        //        if (File.Exists(mainCachedFilePath))
+        //        {
+        //            filesToConcatenate.Add(mainCachedFilePath);
+        //        }
+        //        else
+        //        {
+        //            _logger.LogWarning($"File not found in cache folder: {mainCachedFilePath}");
+        //            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Warning",
+        //                Message = $"File not found in cache folder: {mainCachedFilePath}",
+        //                JobId = jobId,
+        //                WorkOrderId = workOrderId
+        //            });
+        //        }
+
+        //        var workOrderParts = workOrder.Descendants("WorkOrderPart");
+
+
+
+        //        // Create ordered list
+        //        foreach (var part in workOrderParts)
+        //        {
+        //            var filePath = part.Element("FilePath")?.Value;
+        //            if (!string.IsNullOrWhiteSpace(filePath))
+        //            {
+        //                fileOrderList.Add(filePath);
+        //            }
+        //        }
+
+        //        var orderedPartTasks = workOrderParts
+        //            .Select((part, index) => new
+        //            {
+        //                Task = ProcessWorkOrderPartAsync(part, filesToConcatenate, filesSet, cacheFolderPath, workOrderId, jobId, urlToFilePathMapping, cancellationToken),
+        //                OriginalIndex = index
+        //            })
+        //            .ToList();
+
+        //        // Await in original XML order
+        //        foreach (var partTask in orderedPartTasks.OrderBy(t => t.OriginalIndex))
+        //        {
+        //            await partTask.Task;
+        //        }
+
+        //        using (var scope = _serviceScopeFactory.CreateScope())
+        //        {
+        //            var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+
+        //            // Fetch the Job and its UniqueJobId
+        //            var job = await dataAccess.GetJobByIdAsync(jobId);
+        //            if (job == null)
+        //            {
+        //                throw new Exception($"Job with ID {jobId} not found.");
+        //            }
+        //            uniqueJobId = job.UniqueJobId;
+        //            user = job.User;
+
+        //            //_logger.LogInformation($"Using UniqueJobId: {uniqueJobId} for WorkOrderId: {workOrderId}");
+
+        //            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Information",
+        //                Message = $"Using UniqueJobId: {uniqueJobId} for WorkOrderId: {workOrderId}",
+        //                JobId = jobId,
+        //                WorkOrderId = workOrderId
+        //            });
+
+        //            if (filesToConcatenate.Count > 0)
+        //            {
+        //                try
+        //                {
+        //                    var sortedFilesArray = SortFiles(filesToConcatenate, fileOrderList, urlToFilePathMapping);
+
+        //                    await ConcatenatePdfFiles(sortedFilesArray, concatenatedFilePath, jobId, workOrderId, cancellationToken);
+
+        //                    //  _logger.LogInformation($"Concatenated files for work order {workOrderId} into {concatenatedFilePath}");
+        //                    await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Information",
+        //                        Message = $"Concatenated files for work order {workOrderId} into {concatenatedFilePath}",
+        //                        JobId = jobId,
+        //                        WorkOrderId = workOrderId
+        //                    });
+
+        //                    using (var innerScope = _serviceScopeFactory.CreateScope())
+        //                    {
+        //                        var innerDataAccess = innerScope.ServiceProvider.GetRequiredService<IDataAccess>();
+
+        //                        var sendToPrinterSetting = await innerDataAccess.GetConfigurationSettingAsync("AppSettings", "SendToPrinter");
+        //                        var sendToPrinter = sendToPrinterSetting != null && bool.Parse(sendToPrinterSetting.Value);
+
+        //                        var printLocation = job.Print;
+        //                        var printerName = job.Printer ?? "ProdPrinter";
+
+        //                        var printerSetting = await dataAccess.GetPrinterSettingByShortNameAsync(printerName);
+
+        //                        var defaultPrinterSetting = await innerDataAccess.GetConfigurationSettingAsync("AppSettings", "DefaultPrinterName");
+
+        //                        sequence = workOrderParts.FirstOrDefault()?.Element("SeqId")?.Value ?? "0001";
+        //                        objtyp = workOrder.Element("Objtyp")?.Value ?? "BUS2007";
+        //                        var filePath = workOrder.Element("File").Value;
+
+        //                        string statusCodeSuccess = "037";
+        //                        string statusCodeFailure = "009";
+        //                        string statusMessageSuccess = "Work Order complete";
+
+        //                        // Move the file to the Out folder before making the RFC call for status "037"
+        //                        var outFilePath = Path.Combine(jobOutFolderPath, Path.GetFileName(concatenatedFilePath));
+        //                        if (!File.Exists(outFilePath))
+        //                        {
+        //                            File.Move(concatenatedFilePath, outFilePath);
+        //                            _logger.LogInformation($"Moved work order file {workOrderId} to {outFilePath}");
+
+        //                            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                            {
+        //                                Timestamp = DateTime.UtcNow,
+        //                                Level = "Information",
+        //                                Message = $"Moved work order file {workOrderId} to {outFilePath}",
+        //                                JobId = jobId,
+        //                                WorkOrderId = workOrderId
+        //                            });
+        //                        }
+        //                        else
+        //                        {
+        //                            _logger.LogWarning($"File {outFilePath} already exists, skipping move.");
+
+        //                            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                            {
+        //                                Timestamp = DateTime.UtcNow,
+        //                                Level = "Warning",
+        //                                Message = $"File {outFilePath} already exists, skipping move.",
+        //                                JobId = jobId,
+        //                                WorkOrderId = workOrderId
+        //                            });
+        //                        }
+
+        //                        // Use the updated path from the Out folder for the RFC call
+        //                        concatenatedFilePath = outFilePath;
+
+        //                        if (printerSetting == null && printLocation == "N")
+        //                        {
+        //                            hasError = true;
+        //                            string errorMessage = $"Printer with name {printerName} not found. File {concatenatedFilePath} was not sent to the printer.";
+        //                            var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
+        //                            var errorMessages = new List<string> { errorMessage };
+        //                            AddErrorPdfMessages(errorFilePath, errorMessages);
+        //                            await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
+        //                            await dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //                            await dataAccess.AddLogEntryAsync(new LogEntry { Timestamp = DateTime.UtcNow, Level = "Error", Message = $"Updated job status to 'Error' due to printer error for JobId: {jobId}.", JobId = jobId, WorkOrderId = workOrderId });
+        //                        }
+        //                        else if (sendToPrinter)
+        //                        {
+        //                            try
+        //                            {
+        //                                _printerService.PrintFileAsync(printLocation == "N" ? printerSetting.ShortName : printerName, concatenatedFilePath, jobId, printLocation, workOrderId, sequence, objtyp);
+        //                            }
+        //                            catch (Exception ex)
+        //                            {
+        //                                hasError = true;
+        //                                string errorMessage = $"Error sending to printer for work order {workOrderId}: {ex.Message}";
+        //                                //await HandleProcessingErrorAsync(workOrderId, errorMessage, cacheFolderPath, jobId, uniqueJobId, sequence, objtyp, concatenatedFilePath, dataAccess, cancellationToken);
+        //                                throw;
+        //                            }
+        //                        }
+        //                        else
+        //                        {
+        //                            hasError = true;
+        //                            string errorMessage = "Printing is currently disabled. Please enable printing in the system configuration.";
+        //                            var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
+        //                            var errorMessages = new List<string> { errorMessage };
+        //                            AddErrorPdfMessages(errorFilePath, errorMessages);
+        //                            await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
+        //                            await dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //                            await dataAccess.AddLogEntryAsync(new LogEntry { Timestamp = DateTime.UtcNow, Level = "Error", Message = $"Updated job status to 'Error' because printing is disabled for JobId: {jobId}.", JobId = jobId, WorkOrderId = workOrderId });
+        //                        }
+
+        //                        // Check for error PDF before setting final status
+        //                        if (finalStatus != "Error" && !File.Exists(Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf")))
+        //                        {
+        //                            // Update the work order status to Processed
+        //                            await innerDataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Processed", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //                            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                            {
+        //                                Timestamp = DateTime.UtcNow,
+        //                                Level = "Information",
+        //                                Message = $"WorkOrder ID {workOrderId} marked as 'Processed' successfully.",
+        //                                JobId = jobId,
+        //                                WorkOrderId = workOrderId
+        //                            });
+
+        //                            // Update job status to Processed
+        //                            await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Processed", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //                            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                            {
+        //                                Timestamp = DateTime.UtcNow,
+        //                                Level = "Information",
+        //                                Message = $"Job ID {jobId} marked as 'Processed' successfully.",
+        //                                JobId = jobId,
+        //                                WorkOrderId = workOrderId
+        //                            });
+
+        //                            await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, statusCodeSuccess, statusMessageSuccess, sequence, objtyp, concatenatedFilePath, cancellationToken);
+
+        //                            _logger.LogInformation($"Reported status 'Processed' for WorkOrder ID {workOrderId}");
+
+        //                            // Log the success status report to SAP in the database
+        //                            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                            {
+        //                                Timestamp = DateTime.UtcNow,
+        //                                Level = "Information",
+        //                                Message = $"Reported status 'Processed' to SAP for WorkOrder ID {workOrderId}.",
+        //                                JobId = jobId,
+        //                                WorkOrderId = workOrderId
+        //                            });
+        //                        }
+
+        //                        else
+        //                        {
+        //                            finalStatus = "Error";
+        //                            hasError = true;
+
+        //                            sequence = workOrderParts.FirstOrDefault()?.Element("SeqId")?.Value ?? "0001";
+        //                            objtyp = workOrder.Element("Objtyp")?.Value ?? "BUS2007";
+
+        //                            // Initialize error file path and write the error message to the PDF
+        //                            string errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
+
+        //                            var errorMessage = $"An error occurred during processing. Please review the Error work order file {errorFilePath}";
+
+        //                            // Log error creation in the database
+        //                            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                            {
+        //                                Timestamp = DateTime.UtcNow,
+        //                                Level = "Error",
+        //                                Message = $"WorkOrder ID {workOrderId} encountered an error. Created error PDF at {errorFilePath}.",
+        //                                JobId = jobId,
+        //                                WorkOrderId = workOrderId
+        //                            });
+
+        //                            // Send the error status to SAP
+        //                            // await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, "009", errorMessage, sequence, objtyp, errorFilePath, cancellationToken);
+        //                            await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                            {
+        //                                Timestamp = DateTime.UtcNow,
+        //                                Level = "Information",
+        //                                Message = $"Reported error status to SAP for WorkOrder ID {workOrderId} with message: {errorMessage}.",
+        //                                JobId = jobId,
+        //                                WorkOrderId = workOrderId
+        //                            });
+
+        //                            //  _logger.LogInformation($"Reported error status to SAP for WorkOrder ID {workOrderId} due to finalStatus being 'Error'.");
+        //                        }
+
+        //                    }
+        //                }
+        //                catch (Exception ex)
+        //                {
+        //                    hasError = true;
+        //                    _logger.LogError(ex, $"Error concatenating files for work order {workOrderId}");
+
+        //                    // Log error to the database
+        //                    await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Error",
+        //                        Message = $"Error concatenating files for work order {workOrderId}: {ex.Message}",
+        //                        JobId = jobId,
+        //                        WorkOrderId = workOrderId
+        //                    });
+
+        //                    var errorMessages = new List<string> { ex.Message };
+        //                    await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
+
+        //                    var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
+        //                    AddErrorPdfMessages(errorFilePath, errorMessages);
+
+        //                    if (File.Exists(errorFilePath))
+        //                    {
+        //                        filesToConcatenate.Add(errorFilePath);
+
+        //                        await ConcatenatePdfFiles(filesToConcatenate.ToArray(), concatenatedFilePath, jobId, workOrderId, cancellationToken);
+
+        //                        // Log the addition of error files to concatenation in the database
+        //                        await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                        {
+        //                            Timestamp = DateTime.UtcNow,
+        //                            Level = "Information",
+        //                            Message = $"Added error file {errorFilePath} for concatenation for work order {workOrderId}.",
+        //                            JobId = jobId,
+        //                            WorkOrderId = workOrderId
+        //                        });
+        //                    }
+
+        //                    // await _dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //                    await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Error",
+        //                        Message = $"Updated work order status to 'Error' for WorkOrderId: {workOrderId}.",
+        //                        JobId = jobId,
+        //                        WorkOrderId = workOrderId
+        //                    });
+
+        //                    // Update job status to Error
+        //                    // await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //                    await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Error",
+        //                        Message = $"Updated job status to 'Error' for JobId: {jobId} with UniqueJobId: {uniqueJobId}.",
+        //                        JobId = jobId,
+        //                        WorkOrderId = workOrderId
+        //                    });
+
+        //                    // Send the error status to SAP
+        //                    await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, "009", ex.Message, sequence, objtyp, errorFilePath, cancellationToken);
+        //                    await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Information",
+        //                        Message = $"Reported error status to SAP for WorkOrderId: {workOrderId} with error message: {ex.Message}.",
+        //                        JobId = jobId,
+        //                        WorkOrderId = workOrderId
+        //                    });
+
+        //                    //throw;
+        //                }
+
+        //            }
+        //            else
+        //            {
+        //                hasError = true;
+        //                var errorMessage = $"No files found to concatenate for work order {workOrderId}";
+        //                _logger.LogWarning(errorMessage);
+
+        //                // Log warning to the database
+        //                await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Warning",
+        //                    Message = errorMessage,
+        //                    JobId = jobId,
+        //                    WorkOrderId = workOrderId
+        //                });
+
+        //                var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
+        //                var errorMessages = new List<string> { errorMessage };
+        //                AddErrorPdfMessages(errorFilePath, errorMessages);
+
+        //                filesToConcatenate.Add(errorFilePath);
+
+        //                // Save error details to the database
+        //                await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
+
+        //                // Attempt to concatenate error PDF files
+        //                await ConcatenatePdfFiles(filesToConcatenate.ToArray(), concatenatedFilePath, jobId, workOrderId, cancellationToken);
+
+        //                // Update the work order status to "Error" in the database
+        //                // await _dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //                await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Error",
+        //                    Message = $"Updated work order status to 'Error' for WorkOrderId: {workOrderId}",
+        //                    JobId = jobId,
+        //                    WorkOrderId = workOrderId
+        //                });
+
+        //                // Update the job status to "Error" in the database
+        //                //await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //                await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Error",
+        //                    Message = $"Updated job status to 'Error' for JobId: {jobId} with UniqueJobId: {uniqueJobId}",
+        //                    JobId = jobId,
+        //                    WorkOrderId = workOrderId
+        //                });
+
+        //                // Send the error status to SAP
+        //                await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, "009", errorMessage, sequence, objtyp, errorFilePath, cancellationToken);
+
+        //                await _dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Information",
+        //                    Message = $"Reported error status to SAP for WorkOrderId: {workOrderId} with error message: {errorMessage}",
+        //                    JobId = jobId,
+        //                    WorkOrderId = workOrderId
+        //                });
+        //            }
+
+        //        }
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        hasError = true;
+        //        var errorMessages = new List<string> { ex.Message };
+        //        await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
+
+        //        await _dataAccess.AddLogEntryAsync(new LogEntry
+        //        {
+        //            Timestamp = DateTime.UtcNow,
+        //            Level = "Error",
+        //            Message = $"Failed to process work order {workOrderId}: {ex.Message}",
+        //            JobId = jobId,
+        //            WorkOrderId = workOrderId
+        //        });
+
+        //        var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
+        //        AddErrorPdfMessages(errorFilePath, errorMessages);
+
+        //        // await _dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+
+        //        // Update job status to Error
+        //        await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+
+        //        // Send the error status to SAP
+        //        await _statusReporter.ReportStatusAsync(int.Parse(jobId), workOrderId, "009", ex.Message, sequence, objtyp, errorFilePath, cancellationToken);
+
+        //        throw;
+        //    }
+        //    finally
+        //    {
+        //        lockEntry.Semaphore.Release();
+        //        lockEntry.LastUsed = DateTime.UtcNow;
+        //    }
+        //}
 
         private async Task TrackWorkOrderRunAsync(string user, int workOrderCount, string jobId)
         {
@@ -2345,43 +3467,33 @@ namespace PrintPlusService.Services
             }
         }
 
-        // --- Helper methods to reduce duplication and improve readability ---
-
-        private async Task LogInfoAsync(string message, string jobId, string workOrderId, IDataAccess dataAccess)
-        {
-            _logger.LogInformation(message);
-            await dataAccess.AddLogEntryAsync(new LogEntry { Timestamp = DateTime.UtcNow, Level = "Information", Message = message, JobId = jobId, WorkOrderId = workOrderId });
-        }
-
-        private async Task LogWarningAsync(string message, string jobId, string workOrderId, IDataAccess dataAccess)
-        {
-            _logger.LogWarning(message);
-            await dataAccess.AddLogEntryAsync(new LogEntry { Timestamp = DateTime.UtcNow, Level = "Warning", Message = message, JobId = jobId, WorkOrderId = workOrderId });
-        }
-
-        private async Task LogErrorAsync(Exception ex, string message, string jobId, string workOrderId, IDataAccess dataAccess)
-        {
-            _logger.LogError(ex, message);
-            await dataAccess.AddLogEntryAsync(new LogEntry { Timestamp = DateTime.UtcNow, Level = "Error", Message = message, JobId = jobId, WorkOrderId = workOrderId });
-        }
-
         private async Task ProcessWorkOrderPartAsync(
         XElement part,
-        //List<string> filesToConcatenate,
-        HashSet<string> filesToConcatenate,
-        HashSet<string> filesSet,
+        ConcurrentDictionary<string, byte> filesToConcatenate,
+        ConcurrentDictionary<string, byte> filesSet,
         string cacheFolderPath,
         string workOrderId,
         string jobId,
         Dictionary<string, string> urlToFilePathMapping,
         CancellationToken cancellationToken)
         {
-            var partFilePath = part.Element("FilePath").Value;
+            var partFilePath = part.Element("FilePath")?.Value?.Trim();
             string partCachedFilePath = null;
             string uniqueJobId = null;
             bool partHasError = false;
 
-            string lockKey = partFilePath.ToLowerInvariant();
+            string lockKey;
+
+            if (partFilePath.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+            {
+                // For SharePoint links: just normalize slashes
+                lockKey = partFilePath.Replace('\\', '/').ToLowerInvariant();
+            }
+            else
+            {
+                // For local paths: safe to use Path.GetFullPath
+                lockKey = Path.GetFullPath(partFilePath).Replace('\\', '/').ToLowerInvariant();
+            }
 
             var lockEntry = _fileLocks.GetOrAdd(lockKey, _ => new FileLockEntry());
             lockEntry.LastUsed = DateTime.UtcNow;
@@ -2408,7 +3520,7 @@ namespace PrintPlusService.Services
                     }
 
                     uniqueJobId = job.UniqueJobId;
-                    _logger.LogInformation($"Using UniqueJobId: {uniqueJobId} for WorkOrderId: {workOrderId}");
+
                     await dataAccess.AddLogEntryAsync(new LogEntry
                     {
                         Timestamp = DateTime.UtcNow,
@@ -2430,7 +3542,7 @@ namespace PrintPlusService.Services
                             WorkOrderId = workOrderId
                         });
 
-                        var cleanUrl = CleanUrl(partFilePath);
+                        var cleanUrl = CleanURL(partFilePath);
 
                         if (urlToFilePathMapping.TryGetValue(partFilePath, out partCachedFilePath))
                         {
@@ -2464,8 +3576,6 @@ namespace PrintPlusService.Services
 
                             partCachedFilePath = await ConvertToPdf(partCachedFilePath, jobId, cancellationToken);
 
-                            _logger.LogInformation($"Converted downloaded file to PDF: {partCachedFilePath}")
-                                ;
                             await dataAccess.AddLogEntryAsync(new LogEntry
                             {
                                 Timestamp = DateTime.UtcNow,
@@ -2509,8 +3619,6 @@ namespace PrintPlusService.Services
 
                                 partCachedFilePath = await ConvertToPdf(originalFilePath, jobId, cancellationToken);
 
-                                _logger.LogInformation($"Converted downloaded file to PDF: {originalFilePath}");
-
                                 await dataAccess.AddLogEntryAsync(new LogEntry
                                 {
                                     Timestamp = DateTime.UtcNow,
@@ -2537,16 +3645,15 @@ namespace PrintPlusService.Services
                                 JobId = jobId,
                                 WorkOrderId = workOrderId
                             });
-                            throw new FileNotFoundException(errorMessage);
                         }
                     }
 
                     // Add to files list if not already added and file exists
                     if (partCachedFilePath != null && File.Exists(partCachedFilePath))
                     {
-                        if (filesSet.Add(partCachedFilePath))
+                        if (filesSet.TryAdd(partCachedFilePath, 0))
                         {
-                            filesToConcatenate.Add(partCachedFilePath);
+                            filesToConcatenate.TryAdd(partCachedFilePath, 0);
                         }
                     }
                     else
@@ -2572,40 +3679,34 @@ namespace PrintPlusService.Services
             {
                 _logger.LogError(ex, $"Error processing work order part: {partFilePath}");
 
-                // Log the error to the database
                 await _dataAccess.AddLogEntryAsync(new LogEntry
                 {
                     Timestamp = DateTime.UtcNow,
                     Level = "Error",
-                    Message = $"Error processing work order part: {partFilePath} - {ex.Message}",
+                    Message = $"Error processing work order part: {partFilePath} - Not found in cache.",
                     JobId = jobId,
                     WorkOrderId = workOrderId
                 });
 
                 var errorMessages = new List<string> { ex.Message };
-                await SaveErrorDetails(workOrderId, errorMessages, cancellationToken); // Save error details in db
+                await SaveErrorDetails(workOrderId, errorMessages, cancellationToken);
 
                 var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
-                AddErrorPdfMessages(errorFilePath, errorMessages); // Write error to PDF
+                AddErrorPdfMessages(errorFilePath, errorMessages);
 
                 if (File.Exists(errorFilePath))
                 {
-                    if (filesSet.Add(errorFilePath))
+                    if (filesSet.TryAdd(errorFilePath, 0))
                     {
-                        filesToConcatenate.Add(errorFilePath);
+                        filesToConcatenate.TryAdd(errorFilePath, 0);
                     }
                 }
 
-                // Mark this part as having an error
                 partHasError = true;
 
-                // Update the status of the work order part to Error
                 using (var scope = _serviceScopeFactory.CreateScope())
                 {
                     var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
-                    await dataAccess.UpdateWorkOrderPartStatusAsync(uniqueJobId, workOrderId, part.Element("Id").Value, "Error", ex.Message, DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-
-                    // Log the work order part update to the database
                     await dataAccess.AddLogEntryAsync(new LogEntry
                     {
                         Timestamp = DateTime.UtcNow,
@@ -2618,7 +3719,6 @@ namespace PrintPlusService.Services
             }
             finally
             {
-                // Check the status of all parts and update the work order status accordingly
                 using (var scope = _serviceScopeFactory.CreateScope())
                 {
                     var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
@@ -2627,8 +3727,6 @@ namespace PrintPlusService.Services
                     if (parts.Any(p => p.Status == "Error"))
                     {
                         await dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Error", "One or more parts failed", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-
-                        // Log the work order status update to Error in the database
                         await dataAccess.AddLogEntryAsync(new LogEntry
                         {
                             Timestamp = DateTime.UtcNow,
@@ -2638,11 +3736,9 @@ namespace PrintPlusService.Services
                             WorkOrderId = workOrderId
                         });
                     }
-                    else if (!partHasError) // Only update to Processed if there are no errors
+                    else if (!partHasError)
                     {
                         await dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Processed", "", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
-
-                        // Log the work order status update to Processed in the database
                         await dataAccess.AddLogEntryAsync(new LogEntry
                         {
                             Timestamp = DateTime.UtcNow,
@@ -2659,9 +3755,303 @@ namespace PrintPlusService.Services
             }
         }
 
+
+        //private async Task ProcessWorkOrderPartAsync(
+        //XElement part,
+        ////List<string> filesToConcatenate,
+        //HashSet<string> filesToConcatenate,
+        //HashSet<string> filesSet,
+        //string cacheFolderPath,
+        //string workOrderId,
+        //string jobId,
+        //Dictionary<string, string> urlToFilePathMapping,
+        //CancellationToken cancellationToken)
+        //{
+        //    var partFilePath = part.Element("FilePath").Value;
+        //    string partCachedFilePath = null;
+        //    string uniqueJobId = null;
+        //    bool partHasError = false;
+
+        //    string lockKey = partFilePath.ToLowerInvariant();
+
+        //    var lockEntry = _fileLocks.GetOrAdd(lockKey, _ => new FileLockEntry());
+        //    lockEntry.LastUsed = DateTime.UtcNow;
+        //    await lockEntry.Semaphore.WaitAsync(cancellationToken);
+
+        //    try
+        //    {
+        //        using (var scope = _serviceScopeFactory.CreateScope())
+        //        {
+        //            var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //            var job = await dataAccess.GetJobByIdAsync(jobId);
+        //            if (job == null)
+        //            {
+        //                var errorMessage = $"Job with ID {jobId} not found.";
+        //                await dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Error",
+        //                    Message = errorMessage,
+        //                    JobId = jobId,
+        //                    WorkOrderId = workOrderId
+        //                });
+        //                throw new Exception(errorMessage);
+        //            }
+
+        //            uniqueJobId = job.UniqueJobId;
+        //            //_logger.LogInformation($"Using UniqueJobId: {uniqueJobId} for WorkOrderId: {workOrderId}");
+        //            await dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Information",
+        //                Message = $"Using UniqueJobId: {uniqueJobId} for WorkOrderId: {workOrderId}",
+        //                JobId = jobId,
+        //                WorkOrderId = workOrderId
+        //            });
+
+        //            if (part.Element("Type").Value == "URL")
+        //            {
+        //                _logger.LogInformation($"Processing URL part: {partFilePath}");
+        //                await dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Information",
+        //                    Message = $"Processing URL part: {partFilePath}",
+        //                    JobId = jobId,
+        //                    WorkOrderId = workOrderId
+        //                });
+
+        //                var cleanUrl = CleanURL(partFilePath);
+
+        //                if (urlToFilePathMapping.TryGetValue(partFilePath, out partCachedFilePath))
+        //                {
+        //                    _logger.LogInformation($"File already downloaded: {partCachedFilePath}");
+        //                    await dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Information",
+        //                        Message = $"File already downloaded: {partCachedFilePath}",
+        //                        JobId = jobId,
+        //                        WorkOrderId = workOrderId
+        //                    });
+        //                }
+        //                else
+        //                {
+        //                    var errorMessage = $"Failed to download the PDF from the provided SharePoint URL: {partFilePath}.\nPlease verify that the link is accessible and the file exists.";
+        //                    await dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Error",
+        //                        Message = errorMessage,
+        //                        JobId = jobId,
+        //                        WorkOrderId = workOrderId
+        //                    });
+        //                    throw new FileNotFoundException(errorMessage);
+        //                }
+
+        //                if (!partCachedFilePath.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+        //                {
+        //                    _logger.LogInformation($"Converting downloaded file to PDF: {partCachedFilePath}");
+
+        //                    partCachedFilePath = await ConvertToPdf(partCachedFilePath, jobId, cancellationToken);
+
+        //                   // _logger.LogInformation($"Converted downloaded file to PDF: {partCachedFilePath}")
+        //                        ;
+        //                    await dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Information",
+        //                        Message = $"Converted downloaded file to PDF: {partCachedFilePath}",
+        //                        JobId = jobId,
+        //                        WorkOrderId = workOrderId
+        //                    });
+        //                }
+        //            }
+        //            else
+        //            {
+        //                _logger.LogInformation($"Processing local file part: {partFilePath}");
+        //                await dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Information",
+        //                    Message = $"Processing local file part: {partFilePath}",
+        //                    JobId = jobId,
+        //                    WorkOrderId = workOrderId
+        //                });
+
+        //                var partFileName = Path.GetFileName(partFilePath);
+        //                var originalFilePath = Path.Combine(cacheFolderPath, partFileName);
+
+        //                if (File.Exists(originalFilePath))
+        //                {
+        //                    _logger.LogInformation($"Found work order part file: {originalFilePath}");
+        //                    await dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Information",
+        //                        Message = $"Found work order part file: {originalFilePath}",
+        //                        JobId = jobId,
+        //                        WorkOrderId = workOrderId
+        //                    });
+
+        //                    if (!originalFilePath.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+        //                    {
+        //                        _logger.LogInformation($"Converting work order part file to PDF: {originalFilePath}");
+
+        //                        partCachedFilePath = await ConvertToPdf(originalFilePath, jobId, cancellationToken);
+
+        //                        //_logger.LogInformation($"Converted downloaded file to PDF: {originalFilePath}");
+
+        //                        await dataAccess.AddLogEntryAsync(new LogEntry
+        //                        {
+        //                            Timestamp = DateTime.UtcNow,
+        //                            Level = "Information",
+        //                            Message = $"Converted work order part file to PDF: {partCachedFilePath}",
+        //                            JobId = jobId,
+        //                            WorkOrderId = workOrderId
+        //                        });
+        //                        part.Element("FilePath").Value = partCachedFilePath;
+        //                    }
+        //                    else
+        //                    {
+        //                        partCachedFilePath = originalFilePath;
+        //                    }
+        //                }
+        //                else
+        //                {
+        //                    var errorMessage = "File not found: " + originalFilePath;
+        //                    await dataAccess.AddLogEntryAsync(new LogEntry
+        //                    {
+        //                        Timestamp = DateTime.UtcNow,
+        //                        Level = "Error",
+        //                        Message = errorMessage,
+        //                        JobId = jobId,
+        //                        WorkOrderId = workOrderId
+        //                    });
+        //                }
+        //            }
+
+        //            // Add to files list if not already added and file exists
+        //            if (partCachedFilePath != null && File.Exists(partCachedFilePath))
+        //            {
+        //                if (filesSet.Add(partCachedFilePath))
+        //                {
+        //                    filesToConcatenate.Add(partCachedFilePath);
+        //                }
+        //            }
+        //            else
+        //            {
+        //                var errorMessage = $"File {partFilePath} for work order part not found in cache.";
+        //                _logger.LogError(null, errorMessage);
+        //                await dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Error",
+        //                    Message = errorMessage,
+        //                    JobId = jobId,
+        //                    WorkOrderId = workOrderId
+        //                });
+        //                partHasError = true;
+        //                throw new Exception(errorMessage);
+        //            }
+
+        //            await dataAccess.UpdateWorkOrderPartStatusAsync(uniqueJobId, workOrderId, part.Element("Id").Value, "Processed", "", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        //        }
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        _logger.LogError(ex, $"Error processing work order part: {partFilePath}");
+
+        //        // Log the error to the database
+        //        await _dataAccess.AddLogEntryAsync(new LogEntry
+        //        {
+        //            Timestamp = DateTime.UtcNow,
+        //            Level = "Error",
+        //            Message = $"Error processing work order part: {partFilePath} - Not found in cache.",
+        //            JobId = jobId,
+        //            WorkOrderId = workOrderId
+        //        });
+
+        //        var errorMessages = new List<string> { ex.Message };
+        //        await SaveErrorDetails(workOrderId, errorMessages, cancellationToken); // Save error details in db
+
+        //        var errorFilePath = Path.Combine(cacheFolderPath, $"Error_{workOrderId}.pdf");
+        //        AddErrorPdfMessages(errorFilePath, errorMessages); // Write error to PDF
+
+        //        if (File.Exists(errorFilePath))
+        //        {
+        //            if (filesSet.Add(errorFilePath))
+        //            {
+        //                filesToConcatenate.Add(errorFilePath);
+        //            }
+        //        }
+
+        //        // Mark this part as having an error
+        //        partHasError = true;
+
+        //        // Update the status of the work order part to Error
+        //        using (var scope = _serviceScopeFactory.CreateScope())
+        //        {
+        //            var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //           // await dataAccess.UpdateWorkOrderPartStatusAsync(uniqueJobId, workOrderId, part.Element("Id").Value, "Error", ex.Message, DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+
+        //            // Log the work order part update to the database
+        //            await dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Error",
+        //                Message = $"Updated work order part status to Error for WorkOrderId: {workOrderId}, PartId: {part.Element("Id").Value} due to exception: {ex.Message}",
+        //                JobId = jobId,
+        //                WorkOrderId = workOrderId
+        //            });
+        //        }
+        //    }
+        //    finally
+        //    {
+        //        // Check the status of all parts and update the work order status accordingly
+        //        using (var scope = _serviceScopeFactory.CreateScope())
+        //        {
+        //            var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //            var parts = await dataAccess.GetWorkOrderPartsAsync(uniqueJobId, workOrderId);
+
+        //            if (parts.Any(p => p.Status == "Error"))
+        //            {
+        //                await dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Error", "One or more parts failed", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+
+        //                // Log the work order status update to Error in the database
+        //                await dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Error",
+        //                    Message = $"Updated work order status to Error for WorkOrderId: {workOrderId} due to part failures.",
+        //                    JobId = jobId,
+        //                    WorkOrderId = workOrderId
+        //                });
+        //            }
+        //            else if (!partHasError) // Only update to Processed if there are no errors
+        //            {
+        //                await dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workOrderId, "Processed", "", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+
+        //                // Log the work order status update to Processed in the database
+        //                await dataAccess.AddLogEntryAsync(new LogEntry
+        //                {
+        //                    Timestamp = DateTime.UtcNow,
+        //                    Level = "Information",
+        //                    Message = $"Updated work order status to Processed for WorkOrderId: {workOrderId}",
+        //                    JobId = jobId,
+        //                    WorkOrderId = workOrderId
+        //                });
+        //            }
+        //        }
+
+        //        lockEntry.Semaphore.Release();
+        //        lockEntry.LastUsed = DateTime.UtcNow;
+        //    }
+        //}
+
         private string GetMappedPath(string originalUrl, Dictionary<string, string> urlMap, string jobId, string workOrderId)
         {
-            var variants = new[] { originalUrl, CleanUrl(originalUrl), SanitizeFilePath(CleanUrl(originalUrl)) };
+            var variants = new[] { originalUrl, CleanURL(originalUrl), SanitizeFilePath(CleanURL(originalUrl)) };
             foreach (var variant in variants)
             {
                 if (urlMap.TryGetValue(variant, out var mapped)) return mapped;
@@ -2686,7 +4076,7 @@ namespace PrintPlusService.Services
 
             try
             {
-                _logger.LogInformation($"Attempting to convert file to PDF: {filePath}");
+               // _logger.LogInformation($"Attempting to convert file to PDF: {filePath}");
 
                 bool fileReady = await WaitForUnlockAsync(filePath, maxRetries, delayMilliseconds, cancellationToken);
 
@@ -2782,27 +4172,27 @@ namespace PrintPlusService.Services
                         Timestamp = DateTime.UtcNow,
                         Level = "Warning",
                         Message = lockErrorMessage
-                    }).Wait();
+                    }).GetAwaiter().GetResult();
 
                     throw new IOException(lockErrorMessage);
                 }
 
+                // Clone the list to avoid concurrent modification
+                var safeErrorMessages = new List<string>(errorMessages);
+
                 // Add error messages to the PDF file
-                AddErrorPdfMessages(errorFilePath, errorMessages);
+                AddErrorPdfMessages(errorFilePath, safeErrorMessages);
 
-                _logger.LogInformation($"Error PDF saved successfully: {errorFilePath}");
-
-                // Log the success of saving the PDF to the database
+                // Log success of saving the PDF to the database
                 _dataAccess.AddLogEntryAsync(new LogEntry
                 {
                     Timestamp = DateTime.UtcNow,
                     Level = "Information",
                     Message = $"Error PDF saved successfully: {errorFilePath}"
-                }).Wait();
+                }).GetAwaiter().GetResult();
             }
             catch (Exception ex)
             {
-                // Log any exceptions that occur during the process
                 _logger.LogError(ex, $"Failed to save error PDF at {filePath}");
 
                 // Log the exception to the database
@@ -2811,13 +4201,67 @@ namespace PrintPlusService.Services
                     Timestamp = DateTime.UtcNow,
                     Level = "Error",
                     Message = $"Failed to save error PDF at {filePath}: {ex.Message}"
-                }).Wait();
+                }).GetAwaiter().GetResult();
 
-                // Re-throw the exception
                 throw;
             }
         }
-  
+
+        //private void SaveErrorPdf(string filePath, List<string> errorMessages)
+        //{
+        //    try
+        //    {
+        //        // Construct the path for the error PDF file
+        //        var errorFilePath = Path.Combine(Path.GetDirectoryName(filePath), $"{Path.GetFileNameWithoutExtension(filePath)}.pdf");
+
+        //        // Check if the error file is locked before proceeding
+        //        if (File.Exists(errorFilePath) && IsFileLocked(errorFilePath))
+        //        {
+        //            var lockErrorMessage = $"Error PDF file is currently locked and cannot be updated: {errorFilePath}";
+        //            _logger.LogWarning(lockErrorMessage);
+
+        //            // Log the lock error to the database
+        //            _dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Warning",
+        //                Message = lockErrorMessage
+        //            }).Wait();
+
+        //            throw new IOException(lockErrorMessage);
+        //        }
+
+        //        // Add error messages to the PDF file
+        //        AddErrorPdfMessages(errorFilePath, errorMessages);
+
+        //       // _logger.LogInformation($"Error PDF saved successfully: {errorFilePath}");
+
+        //        // Log the success of saving the PDF to the database
+        //        _dataAccess.AddLogEntryAsync(new LogEntry
+        //        {
+        //            Timestamp = DateTime.UtcNow,
+        //            Level = "Information",
+        //            Message = $"Error PDF saved successfully: {errorFilePath}"
+        //        }).Wait();
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        // Log any exceptions that occur during the process
+        //        _logger.LogError(ex, $"Failed to save error PDF at {filePath}");
+
+        //        // Log the exception to the database
+        //        _dataAccess.AddLogEntryAsync(new LogEntry
+        //        {
+        //            Timestamp = DateTime.UtcNow,
+        //            Level = "Error",
+        //            Message = $"Failed to save error PDF at {filePath}: {ex.Message}"
+        //        }).Wait();
+
+        //        // Re-throw the exception
+        //        throw;
+        //    }
+        //}
+
         private void AddPageNumbers(PdfSharpCore.Pdf.PdfDocument document, string jobId, string workorderId)
         {
           
@@ -2850,213 +4294,676 @@ namespace PrintPlusService.Services
                     gfx.DrawString(pageNumberText, font, brush, rect, XStringFormats.BottomRight);
                 }
             }
+        
         }
 
         private async Task ConcatenatePdfFiles(string[] sourceFiles, string outputFilePath, string jobId, string workorderId, CancellationToken cancellationToken)
         {
-            var errorMessages = new List<string>();
-            string uniqueJobId = null;
-            string user = null;
-
+            var stopwatch = Stopwatch.StartNew();
             var lockEntry = _fileLocks.GetOrAdd(outputFilePath, _ => new FileLockEntry());
             await lockEntry.Semaphore.WaitAsync();
 
             try
             {
-                using var innerScope = _serviceScopeFactory.CreateScope();
-                var innerDataAccess = innerScope.ServiceProvider.GetRequiredService<IDataAccess>();
+                using var scope = _serviceScopeFactory.CreateScope();
+                var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+                var job = await dataAccess.GetJobByIdAsync(jobId);
 
-                string currentTimeUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
-
-                using (var scope = _serviceScopeFactory.CreateScope())
+                if (job == null)
                 {
-                    var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
-                    var job = await dataAccess.GetJobByIdAsync(jobId);
-                    if (job == null)
-                    {
-                        throw new Exception($"Job with ID {jobId} not found.");
-                    }
-                    uniqueJobId = job.UniqueJobId;
-                    user = job.User;
-                }
-
-                try
-                {
-                    using (var scope = _serviceScopeFactory.CreateScope())
-                    {
-                        var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
-                        var job = await dataAccess.GetJobByIdAsync(jobId);
-                        if (job == null)
-                        {
-                            var errorMessage = $"Job with ID {jobId} not found.";
-                            _logger.LogError(null, errorMessage);
-                            await dataAccess.AddLogEntryAsync(new LogEntry
-                            {
-                                Timestamp = DateTime.UtcNow,
-                                Level = "Error",
-                                Message = errorMessage,
-                                JobId = jobId
-                            });
-                            throw new Exception(errorMessage);
-                        }
-
-                        uniqueJobId = job.UniqueJobId;
-
-                        // Ensure output file is not locked - retry loop
-                        if (File.Exists(outputFilePath))
-                        {
-                            const int maxRetries = 5;
-                            const int delayMs = 500;
-                            bool deleted = false;
-
-                            for (int attempt = 0; attempt < maxRetries; attempt++)
-                            {
-                                cancellationToken.ThrowIfCancellationRequested();
-
-                                try
-                                {
-                                    using (var fs = File.Open(outputFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
-                                    File.Delete(outputFilePath);
-                                    deleted = true;
-                                    break;
-                                }
-                                catch (IOException ex)
-                                {
-                                    _logger.LogWarning($"Attempt {attempt + 1}: Output file {outputFilePath} is locked, retrying in {delayMs} ms.");
-                                    if (attempt == maxRetries - 1)
-                                    {
-                                        var msg = $"Cannot overwrite {outputFilePath}. It is locked by another process after {maxRetries} attempts.";
-                                        _logger.LogError(ex, msg);
-                                        throw new IOException(msg, ex);
-                                    }
-                                    await Task.Delay(delayMs, cancellationToken);
-                                }
-                            }
-
-                            if (!deleted)
-                            {
-                                throw new IOException($"Failed to delete locked output file {outputFilePath}");
-                            }
-                        }
-
-                        using (var outputDocument = new PdfDocument())
-                        {
-                            bool blankPageInserted = false;
-                            int fileIndex = 0;
-
-                            foreach (var file in sourceFiles)
-                            {
-                                string fileToUse = file;
-                                PdfDocument inputDocument = null;
-
-                                if (File.Exists(fileToUse))
-                                {
-                                    try
-                                    {
-                                        inputDocument = PdfReader.Open(fileToUse, PdfDocumentOpenMode.Import);
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        _logger.LogWarning($"Error reading file: {file}. Attempting repair.");
-
-                                        string repairedPath = Path.Combine(cacheFolderPDFRepairPath, Path.GetFileNameWithoutExtension(file) + "_" + Guid.NewGuid() + ".pdf");
-                                        bool repaired = await Task.Run(() => _fileConverter.TryRepairPdfWithLibreOffice(fileToUse, repairedPath, cacheFolderPDFRepairPath));
-
-                                        if (repaired && File.Exists(repairedPath))
-                                        {
-                                            try
-                                            {
-                                                inputDocument = PdfReader.Open(repairedPath, PdfDocumentOpenMode.Import);
-                                                _logger.LogInformation($"Using repaired file: {repairedPath}");
-                                            }
-                                            catch (Exception repEx)
-                                            {
-                                                string repError = $"Repair failed to parse PDF {file}: {repEx.Message}";
-                                                _logger.LogError(repEx, repError);
-                                                errorMessages.Add(repError);
-                                                var errorFilePath = Path.Combine(Path.GetDirectoryName(outputFilePath), $"Error_{Path.GetFileNameWithoutExtension(outputFilePath)}.pdf");
-                                                AddErrorPdfMessages(errorFilePath, errorMessages);
-                                                await dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workorderId, "Error", repError, currentTimeUtc);
-                                                await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", currentTimeUtc, repError);
-                                                continue;
-                                            }
-                                        }
-                                        else
-                                        {
-                                            string errorMessage = $"PDF appears corrupt and could not be repaired: {file}";
-                                            _logger.LogError(ex, errorMessage);
-                                            errorMessages.Add(errorMessage);
-
-                                            await dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workorderId, "Error", errorMessage, currentTimeUtc);
-                                            await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", currentTimeUtc, errorMessage);
-                                            continue;
-                                        }
-                                    }
-
-                                    if (inputDocument != null)
-                                    {
-                                        if (ShouldInsertBlankPage(fileIndex, job, outputDocument, hasSharepointAttachment, ref blankPageInserted))
-                                        {
-                                            AddBlankPage(outputDocument, inputDocument.Pages[0]);
-                                            blankPageInserted = true;
-                                        }
-
-                                        for (int i = 0; i < inputDocument.PageCount; i++)
-                                        {
-                                            outputDocument.AddPage(inputDocument.Pages[i]);
-                                        }
-                                    }
-
-                                    fileIndex++;
-                                }
-                            }
-
-                            if (outputDocument.PageCount > 0)
-                            {
-                                bool isMegaFile = false;
-                                var pageNumberSetting = await innerDataAccess.GetConfigurationSettingAsync("AppSettings", "PageNumber");
-
-                                // Do a check if the current file being processed is the mega file
-                                isMegaFile = Path.GetFileName(outputFilePath).Equals($"{jobId}.pdf", StringComparison.OrdinalIgnoreCase);
-
-                                // Add only page numbers to the mega file
-                                if (isMegaFile && pageNumberSetting != null && bool.TryParse(pageNumberSetting.Value, out bool pageNumberEnabled) && pageNumberEnabled)
-                                {
-                                    AddPageNumbers(outputDocument, jobId, workorderId);
-                                }
-
-                                outputDocument.Save(outputFilePath);
-                            }
-                            else
-                            {
-                                string errorMessage = "Cannot save a PDF document with no pages.";
-                                _logger.LogError(null, errorMessage);
-                                throw new InvalidOperationException(errorMessage);
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    var errorMessage = $"Error concatenating PDF files into {outputFilePath}: {ex.Message}";
-                    _logger.LogError(ex, errorMessage);
-                    errorMessages.Add(errorMessage);
-
-                    await _dataAccess.AddLogEntryAsync(new LogEntry
+                    var errorMessage = $"Job with ID {jobId} not found.";
+                    _logger.LogWarning(errorMessage);
+                    await dataAccess.AddLogEntryAsync(new LogEntry
                     {
                         Timestamp = DateTime.UtcNow,
                         Level = "Error",
                         Message = errorMessage,
                         JobId = jobId
                     });
-                    throw;
+                    throw new Exception(errorMessage);
                 }
+
+                string uniqueJobId = job.UniqueJobId;
+                string currentTimeUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+                if (File.Exists(outputFilePath))
+                {
+                    const int maxRetries = 5;
+                    const int delayMs = 500;
+                    for (int attempt = 0; attempt < maxRetries; attempt++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        try
+                        {
+                            using (var fs = File.Open(outputFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+                            File.Delete(outputFilePath);
+                            break;
+                        }
+                        catch (IOException ex)
+                        {
+                            _logger.LogWarning($"Attempt {attempt + 1}: Output file {outputFilePath} is locked, retrying in {delayMs} ms.");
+                            if (attempt == maxRetries - 1)
+                            {
+                                throw new IOException($"Cannot overwrite {outputFilePath} after {maxRetries} attempts.", ex);
+                            }
+                            await Task.Delay(delayMs, cancellationToken);
+                        }
+                    }
+                }
+
+                var accessibleFiles = sourceFiles.Where(File.Exists).ToArray();
+
+                if (accessibleFiles.Length == 0)
+                {
+                    throw new InvalidOperationException("No valid PDF files to concatenate.");
+                }
+
+                foreach (var file in accessibleFiles)
+                {
+                    await WaitUntilFileReadyAsync(file, cancellationToken);
+                }
+
+                var repairTasks = accessibleFiles.Select(file => RepairAndOpenPdfAsync(file, dataAccess, jobId, uniqueJobId, workorderId, currentTimeUtc)).ToArray();
+                var results = await Task.WhenAll(repairTasks);
+
+                using var outputDocument = new PdfDocument();
+                bool blankPageInserted = false;
+                int fileIndex = 0;
+
+                foreach (var (file, inputDocument) in results)
+                {
+                    if (inputDocument == null || inputDocument.PageCount == 0)
+                        continue;
+
+                    if (ShouldInsertBlankPage(fileIndex, job, outputDocument, hasSharepointAttachment, ref blankPageInserted))
+                    {
+                        AddBlankPage(outputDocument, inputDocument.Pages[0]);
+                        blankPageInserted = true;
+                    }
+
+                    for (int i = 0; i < inputDocument.PageCount; i++)
+                    {
+                        outputDocument.AddPage(inputDocument.Pages[i]);
+                    }
+
+                    fileIndex++;
+                }
+
+                if (outputDocument.PageCount > 0)
+                {
+                    bool isMegaFile = Path.GetFileName(outputFilePath).Equals($"{jobId}.pdf", StringComparison.OrdinalIgnoreCase);
+                    var pageNumberSetting = await dataAccess.GetConfigurationSettingAsync("AppSettings", "PageNumber");
+
+                    if (isMegaFile && pageNumberSetting != null && bool.TryParse(pageNumberSetting.Value, out bool pageNumberEnabled) && pageNumberEnabled)
+                    {
+                        AddPageNumbers(outputDocument, jobId, workorderId);
+                    }
+
+                    var waterMarkSetting = await dataAccess.GetConfigurationSettingAsync("AppSettings", "Watermark");
+
+                    if (waterMarkSetting != null && bool.TryParse(waterMarkSetting.Value, out bool waterMarkEnalbed) && waterMarkEnalbed)
+                    {
+                        var waterMarkText = (await dataAccess.GetConfigurationSettingAsync("AppSettings", "WatermarkText"))?.Value ?? "Test";
+                        AddWatermark(outputDocument, waterMarkText);
+                    }
+
+                    outputDocument.Save(outputFilePath);
+
+                    stopwatch.Stop();
+                    string elapsedFormatted = stopwatch.Elapsed.ToString(@"mm\:ss");
+                    string fileName = Path.GetFileName(outputFilePath);
+                }
+                else
+                {
+                    throw new InvalidOperationException("Cannot save a PDF document with no pages.");
+                }
+            }
+            catch (Exception ex)
+            {
+                var errorMessage = $"Error concatenating PDF files into {outputFilePath}: {ex.Message}";
+                _logger.LogError(ex, errorMessage);
+                await _dataAccess.AddLogEntryAsync(new LogEntry
+                {
+                    Timestamp = DateTime.UtcNow,
+                    Level = "Error",
+                    Message = errorMessage,
+                    JobId = jobId
+                });
+                throw;
             }
             finally
             {
                 lockEntry.Semaphore.Release();
             }
         }
+
+        private async Task WaitUntilFileReadyAsync(string filePath, CancellationToken ct, int maxRetries = 6, int delayMs = 300)
+        {
+            for (int i = 0; i < maxRetries; i++)
+            {
+                try
+                {
+                    using (var fs = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                        return;
+                }
+                catch (IOException)
+                {
+                    await Task.Delay(delayMs, ct);
+                }
+            }
+
+            throw new IOException($"File is not ready or locked after retries: {filePath}");
+        }
+
+
+        //private async Task ConcatenatePdfFiles(string[] sourceFiles, string outputFilePath, string jobId, string workorderId, CancellationToken cancellationToken)
+        //{
+        //    var stopwatch = Stopwatch.StartNew();
+        //    var lockEntry = _fileLocks.GetOrAdd(outputFilePath, _ => new FileLockEntry());
+        //    await lockEntry.Semaphore.WaitAsync();
+
+        //    try
+        //    {
+        //        using var scope = _serviceScopeFactory.CreateScope();
+        //        var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //        var job = await dataAccess.GetJobByIdAsync(jobId);
+
+        //        if (job == null)
+        //        {
+        //            var errorMessage = $"Job with ID {jobId} not found.";
+        //            _logger.LogWarning(errorMessage);
+        //            await dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Error",
+        //                Message = errorMessage,
+        //                JobId = jobId
+        //            });
+        //            throw new Exception(errorMessage);
+        //        }
+
+        //        string uniqueJobId = job.UniqueJobId;
+        //        string currentTimeUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+        //        if (File.Exists(outputFilePath))
+        //        {
+        //            const int maxRetries = 5;
+        //            const int delayMs = 500;
+        //            for (int attempt = 0; attempt < maxRetries; attempt++)
+        //            {
+        //                cancellationToken.ThrowIfCancellationRequested();
+
+        //                try
+        //                {
+        //                    using (var fs = File.Open(outputFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+        //                    File.Delete(outputFilePath);
+        //                    break;
+        //                }
+        //                catch (IOException ex)
+        //                {
+        //                    _logger.LogWarning($"Attempt {attempt + 1}: Output file {outputFilePath} is locked, retrying in {delayMs} ms.");
+        //                    if (attempt == maxRetries - 1)
+        //                    {
+        //                        throw new IOException($"Cannot overwrite {outputFilePath} after {maxRetries} attempts.", ex);
+        //                    }
+        //                    await Task.Delay(delayMs, cancellationToken);
+        //                }
+        //            }
+        //        }
+
+        //        var accessibleFiles = sourceFiles.Where(File.Exists).ToArray();
+
+        //        var repairTasks = accessibleFiles.Select(file => RepairAndOpenPdfAsync(file, dataAccess, jobId, uniqueJobId, workorderId, currentTimeUtc)).ToArray();
+        //        var results = await Task.WhenAll(repairTasks);
+
+        //        using var outputDocument = new PdfDocument();
+        //        bool blankPageInserted = false;
+        //        int fileIndex = 0;
+
+        //        foreach (var (file, inputDocument) in results)
+        //        {
+        //          //  if (inputDocument == null) continue;
+
+        //            if (ShouldInsertBlankPage(fileIndex, job, outputDocument, hasSharepointAttachment, ref blankPageInserted))
+        //            {
+        //                AddBlankPage(outputDocument, inputDocument.Pages[0]);
+        //                blankPageInserted = true;
+        //            }
+
+        //            for (int i = 0; i < inputDocument.PageCount; i++)
+        //            {
+        //                outputDocument.AddPage(inputDocument.Pages[i]);
+        //            }
+
+        //            fileIndex++;
+        //        }
+
+        //        if (outputDocument.PageCount > 0)
+        //        {
+        //            bool isMegaFile = Path.GetFileName(outputFilePath).Equals($"{jobId}.pdf", StringComparison.OrdinalIgnoreCase);
+        //            var pageNumberSetting = await dataAccess.GetConfigurationSettingAsync("AppSettings", "PageNumber");
+
+        //            // Add page numbering
+        //            if (isMegaFile && pageNumberSetting != null && bool.TryParse(pageNumberSetting.Value, out bool pageNumberEnabled) && pageNumberEnabled)
+        //            {
+        //                AddPageNumbers(outputDocument, jobId, workorderId);
+        //            }
+
+        //            var waterMarkSetting = await dataAccess.GetConfigurationSettingAsync("AppSettings", "Watermark");
+
+        //            // Add watermarking
+        //            if (waterMarkSetting != null && bool.TryParse(waterMarkSetting.Value, out bool waterMarkEnalbed) && waterMarkEnalbed)
+        //            {
+        //                var waterMarkText = (await dataAccess.GetConfigurationSettingAsync("AppSettings", "WatermarkText"))?.Value ?? "Test";
+
+        //                AddWatermark(outputDocument, waterMarkText);
+        //            }
+
+        //            outputDocument.Save(outputFilePath);
+
+        //            stopwatch.Stop();
+        //            string elapsedFormatted = stopwatch.Elapsed.ToString(@"mm\:ss");
+        //            string fileName = Path.GetFileName(outputFilePath);
+
+        //         //   _logger.LogInformation($"PDF concatenation time for '{fileName}': {elapsedFormatted}");
+        //        }
+        //        else
+        //        {
+        //            throw new InvalidOperationException("Cannot save a PDF document with no pages.");
+        //        }
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        var errorMessage = $"Error concatenating PDF files into {outputFilePath}: {ex.Message}";
+        //        _logger.LogError(ex, errorMessage);
+        //        await _dataAccess.AddLogEntryAsync(new LogEntry
+        //        {
+        //            Timestamp = DateTime.UtcNow,
+        //            Level = "Error",
+        //            Message = errorMessage,
+        //            JobId = jobId
+        //        });
+        //        throw;
+        //    }
+        //    finally
+        //    {
+        //        lockEntry.Semaphore.Release();
+        //    }
+        //}
+
+        private async Task<(string file, PdfDocument document)> RepairAndOpenPdfAsync(string file, IDataAccess dataAccess, string jobId, string uniqueJobId, string workorderId, string currentTimeUtc)
+        {
+            try
+            {
+                return (file, PdfReader.Open(file, PdfDocumentOpenMode.Import));
+            }
+            catch
+            {
+                _logger.LogWarning($"Error reading file: {file}. Attempting repair.");
+                string repairedPath = Path.Combine(cacheFolderPDFRepairPath, Path.GetFileNameWithoutExtension(file) + "_" + Guid.NewGuid() + ".pdf");
+                bool repaired = await Task.Run(() => _fileConverter.TryRepairPdfWithLibreOffice(file, repairedPath, cacheFolderPDFRepairPath));
+
+                if (repaired && File.Exists(repairedPath))
+                {
+                    try
+                    {
+                        return (file, PdfReader.Open(repairedPath, PdfDocumentOpenMode.Import));
+                    }
+                    catch (Exception repEx)
+                    {
+                        string repError = $"Repair failed for {file}: {repEx.Message}";
+                        await ReportError(dataAccess, jobId, uniqueJobId, workorderId, repError, currentTimeUtc);
+                        return (file, null);
+                    }
+                }
+                else
+                {
+                    string errorMessage = $"PDF corrupt and not repairable: {file}";
+                    await ReportError(dataAccess, jobId, uniqueJobId, workorderId, errorMessage, currentTimeUtc);
+                    return (file, null);
+                }
+            }
+        }
+
+        private void AddWatermark(PdfDocument document, string watermarkText)
+        {
+            foreach (var page in document.Pages)
+            {
+                var gfx = XGraphics.FromPdfPage(page, XGraphicsPdfPageOptions.Append);
+                var font = new XFont("Arial", 65, XFontStyle.BoldItalic);
+                gfx.TranslateTransform(page.Width / 2, page.Height / 2);
+                gfx.RotateTransform(45);
+                gfx.TranslateTransform(-page.Width / 2, -page.Height / 2);
+
+                gfx.DrawString(
+                    watermarkText,
+                    font,
+                    new XSolidBrush(XColor.FromArgb(75, 255, 0, 0)), // semi-transparent red
+                    new XRect(0, 0, page.Width, page.Height),
+                    XStringFormats.Center);
+            }
+        }
+
+        //private async Task ConcatenatePdfFiles(string[] sourceFiles, string outputFilePath, string jobId, string workorderId, CancellationToken cancellationToken)
+        //{
+        //    var errorMessages = new List<string>();
+        //    var stopwatch = Stopwatch.StartNew(); // ⏱ Start measuring time
+
+        //    var lockEntry = _fileLocks.GetOrAdd(outputFilePath, _ => new FileLockEntry());
+        //    await lockEntry.Semaphore.WaitAsync();
+
+        //    try
+        //    {
+        //        using var scope = _serviceScopeFactory.CreateScope();
+        //        var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //        var job = await dataAccess.GetJobByIdAsync(jobId);
+
+        //        if (job == null)
+        //        {
+        //            var errorMessage = $"Job with ID {jobId} not found.";
+        //            _logger.LogWarning(errorMessage);
+        //            await dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Error",
+        //                Message = errorMessage,
+        //                JobId = jobId
+        //            });
+        //            throw new Exception(errorMessage);
+        //        }
+
+        //        string uniqueJobId = job.UniqueJobId;
+        //        string user = job.User;
+        //        string currentTimeUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+        //        // Check for output file lock
+        //        if (File.Exists(outputFilePath))
+        //        {
+        //            const int maxRetries = 5;
+        //            const int delayMs = 500;
+        //            for (int attempt = 0; attempt < maxRetries; attempt++)
+        //            {
+        //                cancellationToken.ThrowIfCancellationRequested();
+
+        //                try
+        //                {
+        //                    using (var fs = File.Open(outputFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+        //                    File.Delete(outputFilePath);
+        //                    break;
+        //                }
+        //                catch (IOException ex)
+        //                {
+        //                    _logger.LogWarning($"Attempt {attempt + 1}: Output file {outputFilePath} is locked, retrying in {delayMs} ms.");
+        //                    if (attempt == maxRetries - 1)
+        //                    {
+        //                        throw new IOException($"Cannot overwrite {outputFilePath} after {maxRetries} attempts.", ex);
+        //                    }
+        //                    await Task.Delay(delayMs, cancellationToken);
+        //                }
+        //            }
+        //        }
+
+        //        using var outputDocument = new PdfDocument();
+        //        bool blankPageInserted = false;
+        //        int fileIndex = 0;
+
+        //        var accessibleFiles = sourceFiles.Where(File.Exists).ToArray();
+
+        //        foreach (var file in accessibleFiles)
+        //        {
+        //            PdfDocument inputDocument = null;
+        //            try
+        //            {
+        //                inputDocument = PdfReader.Open(file, PdfDocumentOpenMode.Import);
+        //            }
+        //            catch (Exception)
+        //            {
+        //                _logger.LogWarning($"Error reading file: {file}. Attempting repair.");
+        //                string repairedPath = Path.Combine(cacheFolderPDFRepairPath, Path.GetFileNameWithoutExtension(file) + "_" + Guid.NewGuid() + ".pdf");
+        //                bool repaired = await Task.Run(() => _fileConverter.TryRepairPdfWithLibreOffice(file, repairedPath, cacheFolderPDFRepairPath));
+
+        //                if (repaired && File.Exists(repairedPath))
+        //                {
+        //                    try
+        //                    {
+        //                        inputDocument = PdfReader.Open(repairedPath, PdfDocumentOpenMode.Import);
+        //                        _logger.LogInformation($"Using repaired file: {repairedPath}");
+        //                    }
+        //                    catch (Exception repEx)
+        //                    {
+        //                        string repError = $"Repair failed for {file}: {repEx.Message}";
+        //                        await ReportError(dataAccess, jobId, uniqueJobId, workorderId, repError, currentTimeUtc);
+        //                        continue;
+        //                    }
+        //                }
+        //                else
+        //                {
+        //                    string errorMessage = $"PDF corrupt and not repairable: {file}";
+        //                    await ReportError(dataAccess, jobId, uniqueJobId, workorderId, errorMessage, currentTimeUtc);
+        //                    continue;
+        //                }
+        //            }
+
+        //            if (inputDocument != null)
+        //            {
+        //                if (ShouldInsertBlankPage(fileIndex, job, outputDocument, hasSharepointAttachment, ref blankPageInserted))
+        //                {
+        //                    AddBlankPage(outputDocument, inputDocument.Pages[0]);
+        //                    blankPageInserted = true;
+        //                }
+
+        //                for (int i = 0; i < inputDocument.PageCount; i++)
+        //                {
+        //                    outputDocument.AddPage(inputDocument.Pages[i]);
+        //                }
+
+        //                fileIndex++;
+        //            }
+        //        }
+
+        //        if (outputDocument.PageCount > 0)
+        //        {
+        //            bool isMegaFile = Path.GetFileName(outputFilePath).Equals($"{jobId}.pdf", StringComparison.OrdinalIgnoreCase);
+        //            var pageNumberSetting = await dataAccess.GetConfigurationSettingAsync("AppSettings", "PageNumber");
+
+        //            if (isMegaFile && pageNumberSetting != null && bool.TryParse(pageNumberSetting.Value, out bool pageNumberEnabled) && pageNumberEnabled)
+        //            {
+        //                AddPageNumbers(outputDocument, jobId, workorderId);
+        //            }
+
+        //            outputDocument.Save(outputFilePath);
+
+        //            stopwatch.Stop(); // ⏱ Stop timer
+        //            string elapsedFormatted = stopwatch.Elapsed.ToString(@"mm\:ss");
+        //            string fileName = Path.GetFileName(outputFilePath);
+
+        //            _logger.LogInformation($"Final PDF concatenation time for '{fileName}': {elapsedFormatted}");
+        //        }
+        //        else
+        //        {
+        //            throw new InvalidOperationException("Cannot save a PDF document with no pages.");
+        //        }
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        var errorMessage = $"Error concatenating PDF files into {outputFilePath}: {ex.Message}";
+        //        _logger.LogError(ex, errorMessage);
+        //        await _dataAccess.AddLogEntryAsync(new LogEntry
+        //        {
+        //            Timestamp = DateTime.UtcNow,
+        //            Level = "Error",
+        //            Message = errorMessage,
+        //            JobId = jobId
+        //        });
+        //        throw;
+        //    }
+        //    finally
+        //    {
+        //        lockEntry.Semaphore.Release();
+        //    }
+        //}
+
+
+        //private async Task ConcatenatePdfFiles(string[] sourceFiles, string outputFilePath, string jobId, string workorderId, CancellationToken cancellationToken)
+        //{
+        //    var errorMessages = new List<string>();
+
+        //    var lockEntry = _fileLocks.GetOrAdd(outputFilePath, _ => new FileLockEntry());
+        //    await lockEntry.Semaphore.WaitAsync();
+
+        //    try
+        //    {
+        //        using var scope = _serviceScopeFactory.CreateScope();
+        //        var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
+        //        var job = await dataAccess.GetJobByIdAsync(jobId);
+
+        //        if (job == null)
+        //        {
+        //            var errorMessage = $"Job with ID {jobId} not found.";
+        //            _logger.LogWarning(errorMessage);
+        //            await dataAccess.AddLogEntryAsync(new LogEntry
+        //            {
+        //                Timestamp = DateTime.UtcNow,
+        //                Level = "Error",
+        //                Message = errorMessage,
+        //                JobId = jobId
+        //            });
+        //            throw new Exception(errorMessage);
+        //        }
+
+        //        string uniqueJobId = job.UniqueJobId;
+        //        string user = job.User;
+        //        string currentTimeUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+        //        // Early check for output file lock
+        //        if (File.Exists(outputFilePath))
+        //        {
+        //            const int maxRetries = 5;
+        //            const int delayMs = 500;
+        //            for (int attempt = 0; attempt < maxRetries; attempt++)
+        //            {
+        //                cancellationToken.ThrowIfCancellationRequested();
+
+        //                try
+        //                {
+        //                    using (var fs = File.Open(outputFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+        //                    File.Delete(outputFilePath);
+        //                    break;
+        //                }
+        //                catch (IOException ex)
+        //                {
+        //                    _logger.LogWarning($"Attempt {attempt + 1}: Output file {outputFilePath} is locked, retrying in {delayMs} ms.");
+        //                    if (attempt == maxRetries - 1)
+        //                    {
+        //                        throw new IOException($"Cannot overwrite {outputFilePath} after {maxRetries} attempts.", ex);
+        //                    }
+        //                    await Task.Delay(delayMs, cancellationToken);
+        //                }
+        //            }
+        //        }
+
+        //        using var outputDocument = new PdfDocument();
+        //        bool blankPageInserted = false;
+        //        int fileIndex = 0;
+
+        //        var accessibleFiles = sourceFiles.Where(File.Exists).ToArray();
+
+        //        foreach (var file in accessibleFiles)
+        //        {
+        //            PdfDocument inputDocument = null;
+        //            try
+        //            {
+        //                inputDocument = PdfReader.Open(file, PdfDocumentOpenMode.Import);
+        //            }
+        //            catch (Exception)
+        //            {
+        //                _logger.LogWarning($"Error reading file: {file}. Attempting repair.");
+        //                string repairedPath = Path.Combine(cacheFolderPDFRepairPath, Path.GetFileNameWithoutExtension(file) + "_" + Guid.NewGuid() + ".pdf");
+        //                bool repaired = await Task.Run(() => _fileConverter.TryRepairPdfWithLibreOffice(file, repairedPath, cacheFolderPDFRepairPath));
+
+        //                if (repaired && File.Exists(repairedPath))
+        //                {
+        //                    try
+        //                    {
+        //                        inputDocument = PdfReader.Open(repairedPath, PdfDocumentOpenMode.Import);
+        //                        _logger.LogInformation($"Using repaired file: {repairedPath}");
+        //                    }
+        //                    catch (Exception repEx)
+        //                    {
+        //                        string repError = $"Repair failed for {file}: {repEx.Message}";
+        //                        await ReportError(dataAccess, jobId, uniqueJobId, workorderId, repError, currentTimeUtc);
+        //                        continue;
+        //                    }
+        //                }
+        //                else
+        //                {
+        //                    string errorMessage = $"PDF corrupt and not repairable: {file}";
+        //                    await ReportError(dataAccess, jobId, uniqueJobId, workorderId, errorMessage, currentTimeUtc);
+        //                    continue;
+        //                }
+        //            }
+
+        //            if (inputDocument != null)
+        //            {
+        //                if (ShouldInsertBlankPage(fileIndex, job, outputDocument, hasSharepointAttachment, ref blankPageInserted))
+        //                {
+        //                    AddBlankPage(outputDocument, inputDocument.Pages[0]);
+        //                    blankPageInserted = true;
+        //                }
+
+        //                for (int i = 0; i < inputDocument.PageCount; i++)
+        //                {
+        //                    outputDocument.AddPage(inputDocument.Pages[i]);
+        //                }
+
+        //                fileIndex++;
+        //            }
+        //        }
+
+        //        if (outputDocument.PageCount > 0)
+        //        {
+        //            bool isMegaFile = Path.GetFileName(outputFilePath).Equals($"{jobId}.pdf", StringComparison.OrdinalIgnoreCase);
+        //            var pageNumberSetting = await dataAccess.GetConfigurationSettingAsync("AppSettings", "PageNumber");
+
+        //            if (isMegaFile && pageNumberSetting != null && bool.TryParse(pageNumberSetting.Value, out bool pageNumberEnabled) && pageNumberEnabled)
+        //            {
+        //                AddPageNumbers(outputDocument, jobId, workorderId);
+        //            }
+
+        //            outputDocument.Save(outputFilePath);
+        //        }
+        //        else
+        //        {
+        //            throw new InvalidOperationException("Cannot save a PDF document with no pages.");
+        //        }
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        var errorMessage = $"Error concatenating PDF files into {outputFilePath}: {ex.Message}";
+        //        _logger.LogError(ex, errorMessage);
+        //        await _dataAccess.AddLogEntryAsync(new LogEntry
+        //        {
+        //            Timestamp = DateTime.UtcNow,
+        //            Level = "Error",
+        //            Message = errorMessage,
+        //            JobId = jobId
+        //        });
+        //        throw;
+        //    }
+        //    finally
+        //    {
+        //        lockEntry.Semaphore.Release();
+        //    }
+        //}
+
+        private async Task ReportError(IDataAccess dataAccess, string jobId, string uniqueJobId, string workorderId, string errorMessage, string timestamp)
+        {
+            _logger.LogWarning(errorMessage);
+            await dataAccess.UpdateWorkOrderStatusAsync(uniqueJobId, workorderId, "Error", errorMessage, timestamp);
+            await _dataAccess.UpdateJobStatusAsync(jobId, uniqueJobId, "Error", timestamp, errorMessage);
+        }
+
 
         /// <summary>
         /// Sorts a collection of file paths based on a specific custom logic,
@@ -3074,11 +4981,28 @@ namespace PrintPlusService.Services
             var sortedFiles = filePaths
                 .OrderBy(f =>
                 {
-                    string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(f);
+                    string fileName = Path.GetFileNameWithoutExtension(f);
 
-                    // This regex captures the last sequence of digits followed by "Z" or just digits
-                    // e.g., "203Z", "7482"
-                    var match = Regex.Match(fileNameWithoutExtension, @"(\d+Z|\d+)$");
+                    // Custom logic: Detect known header format (e.g., 0000000139_000410000002_0010_GM30)
+                    bool isHeader = Regex.IsMatch(fileName, @"^\d+_\d+_\d+_[A-Z0-9]+$", RegexOptions.IgnoreCase);
+
+                    // Detect pure numeric filenames (likely attachments)
+                    bool isAttachment = Regex.IsMatch(fileName, @"^\d{10,}$");
+
+                    if (isHeader)
+                    {
+                        // Force header files to sort first
+                        return "AA_" + fileName;
+                    }
+
+                    if (isAttachment)
+                    {
+                        // Sort attachments after headers but before regular sort
+                        return "AB_" + fileName;
+                    }
+
+                    // Original logic preserved
+                    var match = Regex.Match(fileName, @"(\d+Z|\d+)$");
 
                     if (match.Success)
                     {
@@ -3086,27 +5010,62 @@ namespace PrintPlusService.Services
 
                         if (sortKey.EndsWith("Z"))
                         {
-                            // To make "203Z" sort before pure numbers like "7482",
-                            // prepend a character that ensures alphabetical sorting.
-                            // "A203Z" will sort before "B..."
                             return "A" + sortKey;
                         }
                         else
                         {
-                            // For purely numerical endings, prepend "B" and pad with leading zeros
-                            // to ensure correct numerical string sorting (e.g., "00007482").
-                            // A pad length of 10 should be sufficient for most common numerical sequences.
                             return "B" + sortKey.PadLeft(10, '0');
                         }
                     }
 
-                    // Fallback: If no specific pattern is found, sort by the full filename without extension
-                    // This ensures files that don't match the pattern are still sorted predictably.
-                    return "C" + fileNameWithoutExtension;
+                    // Fallback: alphabetic order
+                    return "C" + fileName;
                 })
                 .ToArray();
 
             return sortedFiles;
+        }
+
+        public static string[] SortFiles(IEnumerable<string> filePaths, List<string> fileOrderList, Dictionary<string, string> urlToFilePathMapping, List<WorkOrderUrl> extractedUrls)
+        {
+            if (filePaths == null) throw new ArgumentNullException(nameof(filePaths));
+            if (fileOrderList == null) throw new ArgumentNullException(nameof(fileOrderList));
+
+            var fileOrderMap = new Dictionary<string, int>();
+
+            for (int i = 0; i < fileOrderList.Count; i++)
+            {
+                var entry = fileOrderList[i];
+                string localPath = entry;
+
+                if (entry.Contains("http", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (urlToFilePathMapping.TryGetValue(entry, out var resolvedPath))
+                    {
+                        localPath = resolvedPath;
+                    }
+                    else
+                    {
+                        continue; // Skip unresolved links
+                    }
+                }
+
+                var fileName = Path.GetFileName(localPath)?.ToLowerInvariant();
+                if (!string.IsNullOrWhiteSpace(fileName) && !fileOrderMap.ContainsKey(fileName))
+                {
+                    fileOrderMap[fileName] = i;
+                }
+            }
+
+            var sorted = filePaths
+                .OrderBy(path =>
+                {
+                    var fileName = Path.GetFileName(path)?.ToLowerInvariant();
+                    return fileOrderMap.TryGetValue(fileName, out int index) ? index : int.MaxValue;
+                })
+                .ToArray(); 
+
+            return sorted;
         }
 
         private bool ShouldInsertBlankPage(int fileIndex, Job job, PdfDocument outputDoc, bool hasSharepointAttachment, ref bool blankInserted)
@@ -3134,6 +5093,9 @@ namespace PrintPlusService.Services
         {
             try
             {
+                // Create a safe copy of the messages to avoid concurrent modification
+                var safeMessages = new List<string>(errorMessages);
+
                 using (var pdfDocument = new PdfSharpCore.Pdf.PdfDocument())
                 {
                     var page = pdfDocument.AddPage();
@@ -3143,63 +5105,38 @@ namespace PrintPlusService.Services
                     var brush = XBrushes.Black;
                     var redBrush = XBrushes.Red;
 
-                    // Define margins and page layout variables
                     const int leftMargin = 18;
                     const int rightMargin = 18;
                     const int bottomMargin = 60;
                     const double headerHeight = 80;
                     var rectWidth = page.Width - leftMargin - rightMargin;
 
-                    // Draw header
                     gfx.DrawString("Error Report", headerFont, brush, new XRect(leftMargin, 40, rectWidth, headerHeight), XStringFormats.TopCenter);
-
-                    // Draw a line below the header
                     gfx.DrawLine(XPens.Black, leftMargin, 80, page.Width - rightMargin, 80);
 
                     var yPosition = 100;
+                    var tf = new XTextFormatter(gfx) { Alignment = XParagraphAlignment.Left };
 
-                    // Create XTextFormatter for text alignment
-                    var tf = new XTextFormatter(gfx)
+                    foreach (var message in safeMessages)
                     {
-                        Alignment = XParagraphAlignment.Left
-                    };
-
-                    // Loop through error messages and add them to the PDF
-                    foreach (var message in errorMessages)
-                    {
-                        // Define a rectangle area for each message
-                        var rect = new XRect(leftMargin, yPosition, rectWidth, page.Height - yPosition - bottomMargin);
-
-                        // Check if there's enough space, otherwise create a new page
-                        if (yPosition + 20 > page.Height - bottomMargin)
+                        if (yPosition + 40 > page.Height - bottomMargin)
                         {
                             page = pdfDocument.AddPage();
                             gfx.Dispose();
                             gfx = XGraphics.FromPdfPage(page);
-                            tf = new XTextFormatter(gfx)
-                            {
-                                Alignment = XParagraphAlignment.Left
-                            };
-
-                            // Reset yPosition for the new page
+                            tf = new XTextFormatter(gfx) { Alignment = XParagraphAlignment.Left };
                             yPosition = 40;
-
-                            // Draw header on the new page
                             gfx.DrawString("Error Report - Continued", headerFont, brush, new XRect(leftMargin, yPosition, rectWidth, headerHeight), XStringFormats.TopCenter);
                             yPosition += 60;
                         }
 
-                        // Draw the error message within the rectangle
+                        var rect = new XRect(leftMargin, yPosition, rectWidth, 40); // restrict height
                         tf.DrawString($"Error: {message}", errorFont, redBrush, rect, XStringFormats.TopLeft);
+                        yPosition += 40;
 
-                        // Move yPosition for the next message
-                        yPosition += 20;
-
-                        // Save the error message to the database
                         var workOrderId = ExtractWorkOrderIdFromFilePath(filePath);
                         SaveWorkOrderErrorAsync(workOrderId, message).GetAwaiter().GetResult();
 
-                        // Log the entry in the database
                         _dataAccess.AddLogEntryAsync(new LogEntry
                         {
                             Timestamp = DateTime.UtcNow,
@@ -3207,44 +5144,32 @@ namespace PrintPlusService.Services
                             Message = $"PDF Error Report Entry: {message}",
                             WorkOrderId = workOrderId
                         }).GetAwaiter().GetResult();
-                    }
+                    }   
 
-                    // Draw footer line
                     gfx.DrawLine(XPens.Black, leftMargin, page.Height - bottomMargin, page.Width - rightMargin, page.Height - bottomMargin);
-
-                    // Add date/time below the footer line
                     var dateTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
                     gfx.DrawString(dateTime, errorFont, brush, new XRect(leftMargin, page.Height - 40, rectWidth, 0), XStringFormats.BottomLeft);
 
-                    // Save the PDF document
                     pdfDocument.Save(filePath);
-                    _logger.LogInformation($"Error PDF saved successfully: {filePath}");
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Error adding error messages to PDF file: {filePath}");
-
-                // Log to the database
                 _dataAccess.AddLogEntryAsync(new LogEntry
                 {
                     Timestamp = DateTime.UtcNow,
                     Level = "Error",
-                    Message = $"Failed to add error messages to PDF: {ex.Message}",
-                    //  JobId = ExtractJobIdFromFilePath(filePath)
+                    Message = $"File does not exist! Failed to add error messages to PDF: {ex.Message}"
                 }).GetAwaiter().GetResult();
-
-                throw;
             }
         }
-
 
         /// <summary>
         /// Extracts the WorkOrderId from the given file path.
         /// </summary>
         /// <param name="filePath">The file path to extract the WorkOrderId from.</param>
         /// <returns>The extracted WorkOrderId.</returns>
-        private string ExtractWorkOrderIdFromFilePath(string filePath)
+        private static string ExtractWorkOrderIdFromFilePath(string filePath)
         {
             try
             {
@@ -3262,20 +5187,8 @@ namespace PrintPlusService.Services
                 return fileName;
             }
             catch (Exception ex)
-            {
-                // Log any exception that occurs during the extraction process
-                _logger.LogError(ex, $"Error extracting WorkOrderId from file path: {filePath}");
-
-                // Log the exception details in the database
-                _dataAccess.AddLogEntryAsync(new LogEntry
-                {
-                    Timestamp = DateTime.UtcNow,
-                    Level = "Error",
-                    Message = $"Exception while extracting WorkOrderId from file path {filePath}: {ex.Message}",
-                    WorkOrderId = Path.GetFileNameWithoutExtension(filePath) // Use filename as WorkOrderId placeholder
-                }).GetAwaiter().GetResult();
-
-                throw;
+            { 
+                throw ex;
             }
         }
 
@@ -3387,7 +5300,7 @@ namespace PrintPlusService.Services
         /// <returns>A task that represents the asynchronous operation.</returns>
         public async Task SaveWorkOrderErrorAsync(string workOrderId, string errorMessage)
         {
-            _logger.LogInformation($"Saving error for WorkOrderId: {workOrderId}");
+        //    _logger.LogInformation($"Saving error for WorkOrderId: {workOrderId}");
 
             try
             {
@@ -3400,7 +5313,7 @@ namespace PrintPlusService.Services
                     var workOrder = await dataAccess.GetWorkOrderByIdAsync(workOrderId);
                     if (workOrder == null)
                     {
-                        _logger.LogWarning($"WorkOrder with Id {workOrderId} not found.");
+                      //  _logger.LogWarning($"WorkOrder with Id {workOrderId} not found.");
                         return; // Exit if the work order is not found
                     }
 
@@ -3726,7 +5639,8 @@ namespace PrintPlusService.Services
                 using (var reader = new StreamReader(filePath, Encoding.UTF8, true))
                 {
                     var document = XDocument.Load(reader);
-                    var workOrderTasks = document.Descendants("WorkOrder").Select(async workOrderElement =>
+                   // var workOrderTasks = document.Descendants("WorkOrder").Select(async workOrderElement =>
+                    foreach (var workOrderElement in document.Descendants("WorkOrder"))
                     {
                         var workOrderId = workOrderElement.Element("Id").Value;
                         var mainWorkOrderFilePath = workOrderElement.Element("File").Value;
@@ -3753,7 +5667,7 @@ namespace PrintPlusService.Services
                                     throw new Exception($"Job with ID {jobId} not found.");
                                 }
                                 uniqueJobId = job.UniqueJobId;
-                               // _logger.LogInformation($"Using UniqueJobId: {uniqueJobId} for WorkOrderId: {workOrderId}");
+                                // _logger.LogInformation($"Using UniqueJobId: {uniqueJobId} for WorkOrderId: {workOrderId}");
 
                                 // Add new work order regardless of previous existence
                                 var workOrder = new WorkOrder
@@ -3786,7 +5700,7 @@ namespace PrintPlusService.Services
                                     var workOrderPartId = part.Element("Id")?.Value;
                                     try
                                     {
-                                        var partFilePath = CleanUrl(part.Element("FilePath")?.Value);
+                                        var partFilePath = CleanURL(part.Element("FilePath")?.Value);
                                         partFilePath = SanitizeFilePath(partFilePath);
 
                                         workOrderFilePaths.Add(partFilePath);
@@ -3874,9 +5788,10 @@ namespace PrintPlusService.Services
                             }
 
                         }
-                    });
+               //    });
+                    }
 
-                    await Task.WhenAll(workOrderTasks);
+                   // await Task.WhenAll(workOrderTasks);
                 }
             }
             catch (Exception ex)
@@ -3975,8 +5890,8 @@ namespace PrintPlusService.Services
                         Objtyp = workOrderElement.Element("Objtyp")?.Value,
                         File = mainWorkOrderFilePath,
                         Status = "Pending",
-                        CreatedAt = DateTime.UtcNow.ToString("o"),
-                        ProcessedAt = DateTime.UtcNow.ToString("o")
+                        CreatedAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture),
+                        ProcessedAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture)
                     };
 
                     await dataAccess.AddWorkOrderAsync(workOrder);
@@ -3994,7 +5909,7 @@ namespace PrintPlusService.Services
                         try
                         {
                             var partId = part.Element("Id")?.Value;
-                            var partFilePath = SanitizeFilePath(CleanUrl(part.Element("FilePath")?.Value));
+                            var partFilePath = SanitizeFilePath(CleanURL(part.Element("FilePath")?.Value));
                             orderedPaths.Add(partFilePath);
 
                             var workOrderPart = new WorkOrderPart
@@ -4006,8 +5921,8 @@ namespace PrintPlusService.Services
                                 Type = part.Element("Type")?.Value,
                                 FilePath = partFilePath,
                                 Status = "Pending",
-                                CreatedAt = DateTime.UtcNow.ToString("o"),
-                                ProcessedAt = DateTime.UtcNow.ToString("o")
+                                CreatedAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture),
+                                ProcessedAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture)
                             };
 
                             await dataAccess.AddWorkOrderPartAsync(workOrderPart);
@@ -4179,56 +6094,16 @@ namespace PrintPlusService.Services
         /// </summary>
         /// <param name="url">The URL to clean.</param>
         /// <returns>The cleaned URL.</returns>
-        private string CleanUrl(string url)
+        public static string CleanURL(string url)
         {
-            try
-            {
-                if (string.IsNullOrEmpty(url))
-                {
-                    throw new ArgumentException("The URL cannot be null or empty.", nameof(url));
-                }
+            if (string.IsNullOrWhiteSpace(url)) return url;
 
-                //return url.Replace("<![CDATA[", "").Replace("]]>", "").Replace("%20", " ");
-                return url.Replace("<![CDATA[", "").Replace("]]>", "").Replace("%20", " ").Replace("%23", "#");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"Error cleaning URL: {url}");
-
-                // Log the error to the database
-                using (var scope = _serviceScopeFactory.CreateScope())
-                {
-                    var dataAccess = scope.ServiceProvider.GetRequiredService<IDataAccess>();
-                    dataAccess.AddLogEntryAsync(new LogEntry
-                    {
-                        Timestamp = DateTime.UtcNow,
-                        Level = "Error",
-                        Message = $"Error cleaning URL: {url} - {ex.Message}",
-                    }).Wait();
-                }
-
-                throw;
-            }
-        }
-
-        /// <summary>
-        /// Cleans a file name by replacing invalid characters with underscores and truncating
-        /// the length to a maximum of 100 characters if necessary.
-        /// </summary>
-        /// <param name="fileName">The original file name.</param>
-        /// <returns>The sanitized file name.</returns>
-        private string CleanFileName(string fileName)
-        {
-            foreach (char c in Path.GetInvalidFileNameChars())
-            {
-                fileName = fileName.Replace(c, '_');
-            }
-            // Limit filename length to 100 characters
-            if (fileName.Length > 100)
-            {
-                fileName = fileName.Substring(0, 100);
-            }
-            return fileName;
+            return Uri.UnescapeDataString(
+                url.Replace("<![CDATA[", "")
+                   .Replace("]]>", "")
+                   .Replace('\\', '/') // <-- critical!
+                   .Trim()
+            );
         }
 
         /// <summary>
@@ -4412,7 +6287,7 @@ namespace PrintPlusService.Services
             }
 
             // Define the folders to be cleaned up using the SAP server path
-            var foldersToClean = new[] { "Cache", "Out", "Xml" };
+            var foldersToClean = new[] { "Cache", "Out", "XML" };
 
             foreach (var folder in foldersToClean)
             {
