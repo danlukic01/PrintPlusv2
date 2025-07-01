@@ -105,9 +105,27 @@ namespace PrintPlusService.Services
         /// <exception cref="Exception">Thrown if the download process fails or the file cannot be retrieved.</exception>
         public async Task<string> DownloadFileFromShareLinkAsync(string shareLink, string destinationPath)
         {
+            // Normalise URL for consistent caching
+            shareLink = CleanURL(shareLink);
+
+            var cacheKey = $"{shareLink}|{destinationPath}";
+            var downloadTask = _downloadedFileCache.GetOrAdd(cacheKey, _ => DownloadFileFromShareLinkInternalAsync(shareLink, destinationPath));
+
             try
             {
-                shareLink = CleanURL(shareLink);
+                return await downloadTask;
+            }
+            catch
+            {
+                _downloadedFileCache.TryRemove(cacheKey, out _);
+                throw;
+            }
+        }
+
+        private async Task<string> DownloadFileFromShareLinkInternalAsync(string shareLink, string destinationPath)
+        {
+            try
+            {
                 _logger.LogInformation($"Attempting direct download using link: {shareLink}");
 
                 if (!shareLink.Contains("sharepoint.com"))
